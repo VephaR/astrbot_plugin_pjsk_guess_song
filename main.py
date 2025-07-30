@@ -402,11 +402,10 @@ class GuessSongPlugin(Star):  # type: ignore
             y = padding + row_idx * (jacket_h + text_h + padding)
 
             try:
-                relative_jacket_path = f"music_jacket/{option['jacketAssetbundleName']}.png"
-                jacket_img = self._open_image(relative_jacket_path)
-                if not jacket_img: continue
-                
-                jacket = jacket_img.convert("RGBA").resize((jacket_w, jacket_h), LANCZOS)
+                jacket_path = self.resources_dir / "music_jacket" / f"{option['jacketAssetbundleName']}.png"
+                if not jacket_path.exists(): continue
+
+                jacket = Image.open(jacket_path).convert("RGBA").resize((jacket_w, jacket_h), LANCZOS)
                 img.paste(jacket, (x, y), jacket)
                 
                 # --- 优化标号显示 ---
@@ -871,7 +870,7 @@ class GuessSongPlugin(Star):  # type: ignore
         if options_img_path:
             intro_messages.append(Comp.Image(file=options_img_path))
             
-            jacket_path = self._get_resource_path_or_url(f"music_jacket/{correct_song['jacketAssetbundleName']}.png")
+            jacket_path = self.resources_dir / "music_jacket" / f"{correct_song['jacketAssetbundleName']}.png"
         answer_reveal_messages = [
                 Comp.Plain(f"正确答案是: {game_data['correct_answer_num']}. {correct_song['title']}\n"),
                 Comp.Image(file=str(jacket_path))
@@ -1085,12 +1084,11 @@ class GuessSongPlugin(Star):  # type: ignore
         if options_img_path:
             intro_messages.append(Comp.Image(file=options_img_path))
         
-        jacket_source = self._get_resource_path_or_url(f"music_jacket/{correct_song['jacketAssetbundleName']}.png")
+        jacket_path = self.resources_dir / "music_jacket" / f"{correct_song['jacketAssetbundleName']}.png"
         answer_reveal_messages = [
             Comp.Plain(f"正确答案是: {game_data['correct_answer_num']}. {correct_song['title']}\n"),
+            Comp.Image(file=str(jacket_path))
         ]
-        if jacket_source:
-            answer_reveal_messages.append(Comp.Image(file=str(jacket_source)))
         
         await self._run_game_session(event, game_data, intro_messages, answer_reveal_messages)
 
@@ -1169,11 +1167,11 @@ class GuessSongPlugin(Star):  # type: ignore
         # 3. 准备消息
         timeout_seconds = self.config.get("answer_timeout", 30)
         intro_text = f"这首歌是【{song['title']}】，正在演唱的是谁？[1.5倍速]\n请在{timeout_seconds}秒内发送编号回答。\n\n⚠️ 测试功能，不计分\n\n{compact_options_text}"
-        jacket_source = self._get_resource_path_or_url(f"music_jacket/{song['jacketAssetbundleName']}.png")
+        jacket_path = self.resources_dir / "music_jacket" / f"{song['jacketAssetbundleName']}.png"
         
         intro_messages = [Comp.Plain(intro_text)]
-        if jacket_source:
-            intro_messages.append(Comp.Image(file=str(jacket_source)))
+        if jacket_path.exists():
+            intro_messages.append(Comp.Image(file=str(jacket_path)))
             
         correct_vocalist_name = get_vocalist_name(correct_vocal_version)
         answer_reveal_messages = [
@@ -1753,12 +1751,11 @@ class GuessSongPlugin(Star):  # type: ignore
         await event.send(event.chain_result([Comp.Record(file=game_data["clip_path"])]))
         await asyncio.sleep(0.5)
 
-        jacket_source = self._get_resource_path_or_url(f"music_jacket/{correct_song['jacketAssetbundleName']}.png")
+        jacket_path = self.resources_dir / "music_jacket" / f"{correct_song['jacketAssetbundleName']}.png"
         answer_msg = [
             Comp.Plain(f"[测试模式] 正确答案是: {correct_answer_num}. {correct_song['title']}\n"),
+            Comp.Image(file=str(jacket_path))
         ]
-        if jacket_source:
-            answer_msg.append(Comp.Image(file=str(jacket_source)))
         await event.send(event.chain_result(answer_msg))
 
     # --- 统一的听歌功能处理器 ---
@@ -1904,11 +1901,11 @@ class GuessSongPlugin(Star):  # type: ignore
                 return
 
             # 图片部分保持本地逻辑，按您的要求不作改动
-            jacket_source = self._get_resource_path_or_url(f"music_jacket/{song['jacketAssetbundleName']}.png")
+            jacket_path = self.resources_dir / "music_jacket" / f"{song['jacketAssetbundleName']}.png"
             
             msg_chain = [Comp.Plain(f"歌曲:{song['id']}. {song['title']} {config['title_suffix']}\n")]
-            if jacket_source:
-                msg_chain.append(Comp.Image(file=str(jacket_source)))
+            if jacket_path.exists():
+                msg_chain.append(Comp.Image(file=str(jacket_path)))
             
             yield event.chain_result(msg_chain)
             yield event.chain_result([Comp.Record(file=str(mp3_source))])
