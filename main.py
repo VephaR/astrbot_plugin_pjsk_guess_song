@@ -391,7 +391,7 @@ class GuessSongPlugin(Star):  # type: ignore
             logger.error(f"无法打开图片资源 {source}: {e}", exc_info=True)
             return None
 
-    def _get_duration_ms_ffprobe(self, file_path: Union[Path, str]) -> Optional[float]:
+    async def _get_duration_ms_ffprobe(self, file_path: Union[Path, str]) -> Optional[float]:
         """使用 ffprobe 高效获取音频时长，避免用 pydub 加载整个文件。"""
         command = [
             'ffprobe',
@@ -401,7 +401,9 @@ class GuessSongPlugin(Star):  # type: ignore
             str(file_path)
         ]
         try:
-            result = subprocess.run(command, capture_output=True, text=True, check=True, encoding='utf-8')
+            loop = asyncio.get_running_loop()
+            run_subprocess = partial(subprocess.run, command, capture_output=True, text=True, check=True, encoding='utf-8')
+            result = await loop.run_in_executor(self.executor, run_subprocess)
             return float(result.stdout.strip()) * 1000
         except (FileNotFoundError, subprocess.CalledProcessError, ValueError) as e:
             # FileNotFoundError: ffprobe not found
@@ -419,11 +421,8 @@ class GuessSongPlugin(Star):  # type: ignore
     def get_conn(self) -> sqlite3.Connection:
         return sqlite3.connect(self.db_path)
 
-    async def _create_options_image(self, options: List[Dict]) -> Optional[str]:
-        """为12个歌曲选项创建一个3x4的图鉴"""
-        if not options or len(options) != 12:
-            return None
-
+    def _draw_options_image_sync(self, options: List[Dict], jacket_images: List[Optional[Image.Image]]) -> Optional[str]:
+        """[Helper] 同步的选项图片绘制函数"""
         jacket_w, jacket_h = 128, 128
         padding = 15
         text_h = 50 
@@ -435,10 +434,8 @@ class GuessSongPlugin(Star):  # type: ignore
         img = Image.new('RGBA', (img_w, img_h), (245, 245, 245, 255))
         
         try:
-            # 确保使用新字体
             font_path = str(self.resources_dir / "font.ttf")
             title_font = ImageFont.truetype(font_path, 16)
-            # 增大标号字体
             num_font = ImageFont.truetype(font_path, 22) 
         except IOError:
             title_font = ImageFont.load_default()
@@ -447,36 +444,30 @@ class GuessSongPlugin(Star):  # type: ignore
         draw = ImageDraw.Draw(img)
 
         for i, option in enumerate(options):
+            jacket_img = jacket_images[i]
+            if not jacket_img:
+                continue
+
             row_idx, col_idx = i // cols, i % cols
-            
             x = padding + col_idx * (jacket_w + padding)
             y = padding + row_idx * (jacket_h + text_h + padding)
 
             try:
-                relative_jacket_path = f"music_jacket/{option['jacketAssetbundleName']}.png"
-                jacket_img = await self._open_image(relative_jacket_path)
-                if not jacket_img: continue
-                
                 jacket = jacket_img.convert("RGBA").resize((jacket_w, jacket_h), LANCZOS)
                 img.paste(jacket, (x, y), jacket)
                 
-                # --- 优化标号显示 ---
                 num_text = f"{i + 1}"
-                
-                # 绘制一个圆形的背景
                 circle_radius = 16
                 circle_center = (x + circle_radius, y + circle_radius)
                 draw.ellipse(
                     (circle_center[0] - circle_radius, circle_center[1] - circle_radius,
                      circle_center[0] + circle_radius, circle_center[1] + circle_radius),
-                    fill=(0, 0, 0, 180) # 半透明黑色背景
+                    fill=(0, 0, 0, 180)
                 )
                 
-                # 在圆形中心绘制文本
-                pilmoji_drawer = Pilmoji(img)
-                pilmoji_drawer.text(circle_center, num_text, font=num_font, fill=(255, 255, 255), anchor="mm")
+                with Pilmoji(img) as pilmoji_drawer:
+                    pilmoji_drawer.text(circle_center, num_text, font=num_font, fill=(255, 255, 255), anchor="mm")
 
-                # 绘制标题
                 title = option['title']
                 if title_font.getbbox(title)[2] > jacket_w:
                      while title_font.getbbox(title + "...")[2] > jacket_w and len(title) > 1:
@@ -496,6 +487,26 @@ class GuessSongPlugin(Star):  # type: ignore
         img_path = self.output_dir / f"song_options_{int(time.time())}.png"
         img.save(img_path)
         return str(img_path)
+
+    async def _create_options_image(self, options: List[Dict]) -> Optional[str]:
+        """为12个歌曲选项创建一个3x4的图鉴"""
+        if not options or len(options) != 12:
+            return None
+
+        # 1. 异步并发获取所有图片
+        tasks = [self._open_image(f"music_jacket/{opt['jacketAssetbundleName']}.png") for opt in options]
+        jacket_images = await asyncio.gather(*tasks)
+
+        # 2. 在线程池中执行CPU密集的绘图操作
+        loop = asyncio.get_running_loop()
+        try:
+            img_path = await loop.run_in_executor(
+                self.executor, self._draw_options_image_sync, options, jacket_images
+            )
+            return img_path
+        except Exception as e:
+            logger.error(f"在executor中创建选项图片失败: {e}", exc_info=True)
+            return None
 
     def _cleanup_output_dir(self, max_age_seconds: int = 3600):
         if not self.output_dir.exists(): return
@@ -622,7 +633,7 @@ class GuessSongPlugin(Star):  # type: ignore
         # 路径A: 快速路径 (直接使用ffmpeg，性能高)
         if not use_slow_path:
             try:
-                total_duration_ms = self._get_duration_ms_ffprobe(audio_source)
+                total_duration_ms = await self._get_duration_ms_ffprobe(audio_source)
                 if total_duration_ms is None:
                     raise ValueError("ffprobe failed or not found.")
 
@@ -764,7 +775,7 @@ class GuessSongPlugin(Star):  # type: ignore
             logger.error(f"Pydub processing in executor failed: {e}", exc_info=True)
             return None
 
-    def _check_game_start_conditions(self, event: AstrMessageEvent) -> Tuple[bool, Optional[str]]:
+    async def _check_game_start_conditions(self, event: AstrMessageEvent) -> Tuple[bool, Optional[str]]:
         """检查是否可以开始新游戏，返回(布尔值, 提示信息)"""
         if not self._is_group_allowed(event): 
             return False, None
@@ -780,7 +791,9 @@ class GuessSongPlugin(Star):  # type: ignore
         if session_id in self.context.active_game_sessions:
             return False, "......有一个正在进行的游戏了呢。"
         
-        if not debug_mode and not self._can_play(event.get_sender_id()):
+        loop = asyncio.get_running_loop()
+        can_play = await loop.run_in_executor(self.executor, self._can_play, event.get_sender_id())
+        if not debug_mode and not can_play:
             limit = self.config.get('daily_play_limit', 15)
             return False, f"......你今天的游戏次数已达上限（{limit}次），请明天再来吧......"
             
@@ -851,8 +864,9 @@ class GuessSongPlugin(Star):  # type: ignore
                     score_to_add = game_data.get("score", 1)
 
             if game_data.get("game_mode", "song") == "song":
-                self._update_stats(user_id, user_name, score_to_add, correct=is_correct)
-                self._update_mode_stats(game_data.get('mode', 'normal'), is_correct)
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(self.executor, self._update_stats, user_id, user_name, score_to_add, is_correct)
+                await loop.run_in_executor(self.executor, self._update_mode_stats, game_data.get('mode', 'normal'), is_correct)
 
             if is_correct and can_score:
                 if user_id not in correct_players:
@@ -898,7 +912,7 @@ class GuessSongPlugin(Star):  # type: ignore
         lock = self.context.game_session_locks.setdefault(session_id, asyncio.Lock())
 
         async with lock:
-            can_start, message = self._check_game_start_conditions(event)
+            can_start, message = await self._check_game_start_conditions(event)
             if not can_start:
                 if message:
                     await event.send(event.plain_result(message))
@@ -911,7 +925,10 @@ class GuessSongPlugin(Star):  # type: ignore
         # --- 新增：发送统计信标 ---
         asyncio.create_task(self._send_stats_ping("guess_song"))
         if not debug_mode:
-            self._record_game_start(event.get_sender_id(), event.get_sender_name())
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(
+                self.executor, self._record_game_start, event.get_sender_id(), event.get_sender_name()
+            )
         
         # 将同步的音频处理任务扔到线程池中执行
         try:
@@ -997,7 +1014,7 @@ class GuessSongPlugin(Star):  # type: ignore
         lock = self.context.game_session_locks.setdefault(session_id, asyncio.Lock())
 
         async with lock:
-            can_start, message = self._check_game_start_conditions(event)
+            can_start, message = await self._check_game_start_conditions(event)
             if not can_start:
                 if message:
                     await event.send(event.plain_result(message))
@@ -1010,7 +1027,10 @@ class GuessSongPlugin(Star):  # type: ignore
         # --- 新增：为随机模式发送统计信标 ---
         asyncio.create_task(self._send_stats_ping("guess_song_random"))
         if not debug_mode:
-            self._record_game_start(event.get_sender_id(), event.get_sender_name())
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(
+                self.executor, self._record_game_start, event.get_sender_id(), event.get_sender_name()
+            )
         
         # --- 新逻辑：根据分数加权随机选择效果组合 ---
         # --- 新增：轻量模式处理 ---
@@ -1187,7 +1207,7 @@ class GuessSongPlugin(Star):  # type: ignore
         lock = self.context.game_session_locks.setdefault(session_id, asyncio.Lock())
         
         async with lock:
-            can_start, message = self._check_game_start_conditions(event)
+            can_start, message = await self._check_game_start_conditions(event)
             if not can_start:
                 if message:
                     await event.send(event.plain_result(message))
@@ -1200,7 +1220,10 @@ class GuessSongPlugin(Star):  # type: ignore
         # --- 新增：为猜歌手模式发送统计信标 ---
         asyncio.create_task(self._send_stats_ping("guess_song_vocalist"))
         if not debug_mode:
-            self._record_game_start(event.get_sender_id(), event.get_sender_name())
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(
+                self.executor, self._record_game_start, event.get_sender_id(), event.get_sender_name()
+            )
         
         # 1. 准备游戏数据
         song = random.choice(self.another_vocal_songs)
@@ -1297,17 +1320,32 @@ class GuessSongPlugin(Star):  # type: ignore
     async def show_ranking(self, event: AstrMessageEvent):
         """显示猜歌排行榜"""
         if not self._is_group_allowed(event): return
-        self._cleanup_output_dir()
+        
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(self.executor, self._cleanup_output_dir)
 
-        with self.get_conn() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT user_id, user_name, score, attempts, correct_attempts FROM user_stats ORDER BY score DESC LIMIT 10")
-            rows = cursor.fetchall()
+        rows = await loop.run_in_executor(self.executor, self._get_ranking_data_sync)
 
         if not rows:
             yield event.plain_result("......目前还没有人参与过猜歌游戏")
             return
 
+        img_path = await loop.run_in_executor(self.executor, self._draw_ranking_image_sync, rows)
+        
+        if img_path:
+            yield event.image_result(img_path)
+        else:
+            yield event.plain_result("生成排行榜图片时出错。")
+            
+    def _get_ranking_data_sync(self):
+        """[Helper] 同步获取排行榜数据"""
+        with self.get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT user_id, user_name, score, attempts, correct_attempts FROM user_stats ORDER BY score DESC LIMIT 10")
+            return cursor.fetchall()
+
+    def _draw_ranking_image_sync(self, rows) -> Optional[str]:
+        """[Helper] 同步绘制排行榜图片"""
         try:
             # 移植猜卡插件的排行榜生成逻辑以获得更好看的样式
             width, height = 650, 950
@@ -1397,12 +1435,12 @@ class GuessSongPlugin(Star):  # type: ignore
 
             img_path = self.output_dir / f"song_ranking_{int(time.time())}.png"
             img.save(img_path)
-            yield event.image_result(str(img_path))
+            return str(img_path)
 
         except Exception as e:
-            logger.error(f"生成猜歌排行榜失败: {e}", exc_info=True)
-            yield event.plain_result("生成排行榜图片时出错。")
-            
+            logger.error(f"生成猜歌排行榜图片时出错: {e}", exc_info=True)
+            return None
+
     @filter.command("猜歌分数", alias={"gsscore", "我的猜歌分数"})
     async def show_user_score(self, event: AstrMessageEvent):
         """显示玩家自己的猜歌积分和统计数据"""
@@ -1410,23 +1448,15 @@ class GuessSongPlugin(Star):  # type: ignore
         user_id = event.get_sender_id()
         user_name = event.get_sender_name()
         
-        with self.get_conn() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT score, attempts, correct_attempts, last_play_date, daily_plays FROM user_stats WHERE user_id = ?", (user_id,))
-            user_data = cursor.fetchone()
+        loop = asyncio.get_running_loop()
+        full_user_data = await loop.run_in_executor(self.executor, self._get_user_score_data_sync, user_id)
             
-        if not user_data:
+        if not full_user_data:
             yield event.plain_result(f"......{user_name}，你还没有参与过猜歌游戏哦。")
             return
             
-        score, attempts, correct_attempts, last_play_date, daily_plays = user_data
+        score, attempts, correct_attempts, last_play_date, daily_plays, rank = full_user_data
         accuracy = (correct_attempts * 100 / attempts) if attempts > 0 else 0
-        
-        # 计算排名
-        with self.get_conn() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT COUNT(*) FROM user_stats WHERE score > ?", (score,))
-            rank = cursor.fetchone()[0] + 1  # 排名 = 比自己分数高的人数 + 1
         
         daily_limit = self.config.get("daily_play_limit", 15)
         remaining_plays = daily_limit - daily_plays if last_play_date == time.strftime("%Y-%m-%d") else daily_limit
@@ -1531,15 +1561,24 @@ class GuessSongPlugin(Star):  # type: ignore
         parts = event.message_str.strip().split()
         target_id = parts[1] if len(parts) > 1 and parts[1].isdigit() else event.get_sender_id()
 
+        loop = asyncio.get_running_loop()
+        success = await loop.run_in_executor(self.executor, self._reset_guess_limit_sync, target_id)
+
+        if success:
+            yield event.plain_result(f"......用户 {target_id} 的猜歌次数已重置。")
+        else:
+            yield event.plain_result(f"......未找到用户 {target_id} 的游戏记录。")
+
+    def _reset_guess_limit_sync(self, target_id: str) -> bool:
+        """[Helper] 同步重置用户猜歌次数"""
         with self.get_conn() as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT 1 FROM user_stats WHERE user_id = ?", (str(target_id),))
             if cursor.fetchone():
                 cursor.execute("UPDATE user_stats SET daily_plays = 0 WHERE user_id = ?", (str(target_id),))
                 conn.commit()
-                yield event.plain_result(f"......用户 {target_id} 的猜歌次数已重置。")
-            else:
-                yield event.plain_result(f"......未找到用户 {target_id} 的游戏记录。")
+                return True
+            return False
 
     @filter.command("重置听歌次数", alias={"resetls"})
     async def reset_listen_limit(self, event: AstrMessageEvent):
@@ -1550,15 +1589,31 @@ class GuessSongPlugin(Star):  # type: ignore
         parts = event.message_str.strip().split()
         target_id = parts[1] if len(parts) > 1 and parts[1].isdigit() else event.get_sender_id()
 
+        loop = asyncio.get_running_loop()
+        success = await loop.run_in_executor(self.executor, self._reset_listen_limit_sync, target_id)
+
+        if success:
+            await event.send(event.plain_result(f"......用户 {target_id} 的听歌次数已重置。"))
+        else:
+            await event.send(event.plain_result(f"......未找到用户 {target_id} 的游戏记录。"))
+
+    def _reset_listen_limit_sync(self, target_id: str) -> bool:
+        """[Helper] 同步重置用户每日听歌次数"""
         with self.get_conn() as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT 1 FROM user_stats WHERE user_id = ?", (str(target_id),))
             if cursor.fetchone():
                 cursor.execute("UPDATE user_stats SET daily_listen_plays = 0 WHERE user_id = ?", (str(target_id),))
                 conn.commit()
-                await event.send(event.plain_result(f"......用户 {target_id} 的听歌次数已重置。"))
-            else:
-                await event.send(event.plain_result(f"......未找到用户 {target_id} 的游戏记录。"))
+                return True
+            return False
+
+    def _reset_mode_stats_sync(self):
+        """[Helper] 同步清空所有题型统计数据"""
+        with self.get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM mode_stats")
+            conn.commit()
 
     @filter.command("重置题型统计", alias={"resetmodestats"})
     async def reset_mode_stats(self, event: AstrMessageEvent):
@@ -1566,10 +1621,8 @@ class GuessSongPlugin(Star):  # type: ignore
         if str(event.get_sender_id()) not in self.config.get("super_users", []):
             return
         
-        with self.get_conn() as conn:
-            cursor = conn.cursor()
-            cursor.execute("DELETE FROM mode_stats")
-            conn.commit()
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(self.executor, self._reset_mode_stats_sync)
         
         await event.send(event.plain_result("......所有题型统计数据已被清空。"))
 
@@ -1578,7 +1631,11 @@ class GuessSongPlugin(Star):  # type: ignore
         logger.info("正在关闭猜歌插件的线程池和后台任务...")
         if self._cleanup_task:
             self._cleanup_task.cancel()
-        self.executor.shutdown(wait=False)
+        
+        # 等待线程池任务完成
+        self.executor.shutdown(wait=True)
+        logger.info("ThreadPoolExecutor已关闭。")
+
         if self.http_session and not self.http_session.closed:
             await self.http_session.close()
             logger.info("aiohttp session已关闭。")
@@ -1603,10 +1660,10 @@ class GuessSongPlugin(Star):  # type: ignore
     async def show_mode_stats(self, event: AstrMessageEvent):
         """显示各题型的正确率统计（图片排行）"""
         if not self._is_group_allowed(event): return
-        with self.get_conn() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT mode, total_attempts, correct_attempts FROM mode_stats")
-            rows = cursor.fetchall()
+        
+        loop = asyncio.get_running_loop()
+        rows = await loop.run_in_executor(self.executor, self._get_mode_stats_sync)
+
         if not rows:
             yield event.plain_result("暂无题型统计数据。"); return
         # 计算正确率并排序
@@ -1615,90 +1672,108 @@ class GuessSongPlugin(Star):  # type: ignore
             acc = (correct * 100 / total) if total > 0 else 0
             stats.append((mode, total, correct, acc))
         stats.sort(key=lambda x: x[3])  # 按正确率升序
-        # 生成图片
-        img = self._draw_mode_stats_image(stats)
-        img_path = self.output_dir / f"mode_stats_{int(time.time())}.png"
-        img.save(img_path)
-        yield event.image_result(str(img_path)) 
+        
+        # 在线程池中生成图片
+        img_path = await loop.run_in_executor(self.executor, self._draw_mode_stats_image_sync, stats)
 
-    def _draw_mode_stats_image(self, stats):
-        # 固定排行榜分辨率
-        width, height = 650, 950
-        bg_color_start, bg_color_end = (230, 240, 255), (200, 210, 240)
-        img = Image.new("RGB", (width, height), bg_color_start)
-        draw_bg = ImageDraw.Draw(img)
-        for y in range(height):
-            r = int(bg_color_start[0] + (bg_color_end[0] - bg_color_start[0]) * y / height)
-            g = int(bg_color_start[1] + (bg_color_end[1] - bg_color_start[1]) * y / height)
-            b = int(bg_color_start[2] + (bg_color_end[2] - bg_color_start[2]) * y / height)
-            draw_bg.line([(0, y), (width, y)], fill=(r, g, b))
-        background_path = self.resources_dir / "ranking_bg.png"
-        if background_path.exists():
-            try:
-                custom_bg = Image.open(background_path).convert("RGBA").resize((width, height), LANCZOS)
-                custom_bg.putalpha(128)
-                img = img.convert("RGBA")
-                img = Image.alpha_composite(img, custom_bg)
-            except Exception as e:
-                logger.warning(f"加载或混合自定义背景图片失败: {e}")
-        if img.mode != 'RGBA': img = img.convert('RGBA')
-        white_overlay = Image.new("RGBA", img.size, (255, 255, 255, 100))
-        img = Image.alpha_composite(img, white_overlay)
-        font_color, shadow_color = (30, 30, 50), (180, 180, 190, 128)
-        header_color, score_color, accuracy_color = (80, 90, 120), (235, 120, 20), (0, 128, 128)
+        if img_path:
+            yield event.image_result(img_path) 
+        else:
+            yield event.plain_result("生成统计图片时出错。")
+
+    def _get_mode_stats_sync(self):
+        """[Helper] 同步获取题型统计数据"""
+        with self.get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT mode, total_attempts, correct_attempts FROM mode_stats")
+            return cursor.fetchall()
+
+    def _draw_mode_stats_image_sync(self, stats) -> Optional[str]:
+        """[Helper] 同步绘制题型统计图片"""
         try:
-            font_path = self.resources_dir / "font.ttf"
-            title_font = ImageFont.truetype(str(font_path), 44)
-            header_font = ImageFont.truetype(str(font_path), 28)
-            body_font = ImageFont.truetype(str(font_path), 26)
-        except IOError:
-            title_font = header_font = body_font = ImageFont.load_default()
-        with Pilmoji(img) as pilmoji:
-            title_text = "题型正确率排行"
-            center_x, title_y = int(width / 2), 60
-            pilmoji.text((center_x + 2, title_y + 2), title_text, font=title_font, fill=shadow_color, anchor="mm")
-            pilmoji.text((center_x, title_y), title_text, font=title_font, fill=font_color, anchor="mm")
-            headers = ["题型", "答对/总数", "正确率"]
-            col_positions = [60, 320, 500]
-            current_y = title_y + 50
-            for i, header in enumerate(headers):
-                pilmoji.text((col_positions[i], current_y), header, font=header_font, fill=header_color)
-            current_y += 45
-            max_mode_width = col_positions[1] - col_positions[0] - 20
-            for i, (mode, total, correct, acc) in enumerate(stats):
-                mode_disp = self._mode_display_name(mode)
-                # 自动换行处理
-                lines = []
-                temp = ""
-                for ch in mode_disp:
-                    if pilmoji.getsize(temp + ch, font=body_font)[0] > max_mode_width and temp:
+            # 固定排行榜分辨率
+            width, height = 650, 950
+            bg_color_start, bg_color_end = (230, 240, 255), (200, 210, 240)
+            img = Image.new("RGB", (width, height), bg_color_start)
+            draw_bg = ImageDraw.Draw(img)
+            for y in range(height):
+                r = int(bg_color_start[0] + (bg_color_end[0] - bg_color_start[0]) * y / height)
+                g = int(bg_color_start[1] + (bg_color_end[1] - bg_color_start[1]) * y / height)
+                b = int(bg_color_start[2] + (bg_color_end[2] - bg_color_start[2]) * y / height)
+                draw_bg.line([(0, y), (width, y)], fill=(r, g, b))
+            background_path = self.resources_dir / "ranking_bg.png"
+            if background_path.exists():
+                try:
+                    custom_bg = Image.open(background_path).convert("RGBA").resize((width, height), LANCZOS)
+                    custom_bg.putalpha(128)
+                    img = img.convert("RGBA")
+                    img = Image.alpha_composite(img, custom_bg)
+                except Exception as e:
+                    logger.warning(f"加载或混合自定义背景图片失败: {e}")
+            if img.mode != 'RGBA': img = img.convert('RGBA')
+            white_overlay = Image.new("RGBA", img.size, (255, 255, 255, 100))
+            img = Image.alpha_composite(img, white_overlay)
+            font_color, shadow_color = (30, 30, 50), (180, 180, 190, 128)
+            header_color, score_color, accuracy_color = (80, 90, 120), (235, 120, 20), (0, 128, 128)
+            try:
+                font_path = self.resources_dir / "font.ttf"
+                title_font = ImageFont.truetype(str(font_path), 44)
+                header_font = ImageFont.truetype(str(font_path), 28)
+                body_font = ImageFont.truetype(str(font_path), 26)
+            except IOError:
+                title_font = header_font = body_font = ImageFont.load_default()
+            with Pilmoji(img) as pilmoji:
+                title_text = "题型正确率排行"
+                center_x, title_y = int(width / 2), 60
+                pilmoji.text((center_x + 2, title_y + 2), title_text, font=title_font, fill=shadow_color, anchor="mm")
+                pilmoji.text((center_x, title_y), title_text, font=title_font, fill=font_color, anchor="mm")
+                headers = ["题型", "答对/总数", "正确率"]
+                col_positions = [60, 320, 500]
+                current_y = title_y + 50
+                for i, header in enumerate(headers):
+                    pilmoji.text((col_positions[i], current_y), header, font=header_font, fill=header_color)
+                current_y += 45
+                max_mode_width = col_positions[1] - col_positions[0] - 20
+                for i, (mode, total, correct, acc) in enumerate(stats):
+                    mode_disp = self._mode_display_name(mode)
+                    # 自动换行处理
+                    lines = []
+                    temp = ""
+                    for ch in mode_disp:
+                        if pilmoji.getsize(temp + ch, font=body_font)[0] > max_mode_width and temp:
+                            lines.append(temp)
+                            temp = ch
+                        else:
+                            temp += ch
+                    if temp:
                         lines.append(temp)
-                        temp = ch
-                    else:
-                        temp += ch
-                if temp:
-                    lines.append(temp)
 
-                # 动态计算行高和垂直居中位置
-                line_spacing = 32
-                block_height = line_spacing * (len(lines))
-                row_center_y = current_y + block_height / 2
+                    # 动态计算行高和垂直居中位置
+                    line_spacing = 32
+                    block_height = line_spacing * (len(lines))
+                    row_center_y = current_y + block_height / 2
 
-                for idx, line in enumerate(lines):
-                    pilmoji.text((col_positions[0], current_y + idx * line_spacing + 5), line, font=body_font, fill=font_color)
-                
-                # 将统计数据与文本块垂直居中
-                pilmoji.text((col_positions[1], row_center_y), f"{correct}/{total}", font=body_font, fill=score_color, anchor="lm")
-                pilmoji.text((col_positions[2], row_center_y), f"{acc:.1f}%", font=body_font, fill=accuracy_color, anchor="lm")
-                
-                row_height = max(70, block_height + 15)
-                if i < len(stats) - 1:
-                    draw = ImageDraw.Draw(img)
-                    draw.line([(40, current_y + row_height - 8), (width - 40, current_y + row_height - 8)], fill=(200, 200, 210, 128), width=1)
-                current_y += row_height
-            footer_text = f"GuessSong v{PLUGIN_VERSION} | Generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-            pilmoji.text((center_x, height - 25), footer_text, font=body_font, fill=header_color, anchor="ms")
-        return img
+                    for idx, line in enumerate(lines):
+                        pilmoji.text((col_positions[0], current_y + idx * line_spacing + 5), line, font=body_font, fill=font_color)
+                    
+                    # 将统计数据与文本块垂直居中
+                    pilmoji.text((col_positions[1], row_center_y), f"{correct}/{total}", font=body_font, fill=score_color, anchor="lm")
+                    pilmoji.text((col_positions[2], row_center_y), f"{acc:.1f}%", font=body_font, fill=accuracy_color, anchor="lm")
+                    
+                    row_height = max(70, block_height + 15)
+                    if i < len(stats) - 1:
+                        draw = ImageDraw.Draw(img)
+                        draw.line([(40, current_y + row_height - 8), (width - 40, current_y + row_height - 8)], fill=(200, 200, 210, 128), width=1)
+                    current_y += row_height
+                footer_text = f"GuessSong v{PLUGIN_VERSION} | Generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                pilmoji.text((center_x, height - 25), footer_text, font=body_font, fill=header_color, anchor="ms")
+            
+            img_path = self.output_dir / f"mode_stats_{int(time.time())}.png"
+            img.save(img_path)
+            return str(img_path)
+        except Exception as e:
+            logger.error(f"生成题型统计图片时出错: {e}", exc_info=True)
+            return None
 
     def _mode_display_name(self, mode):
         # 题型名美化
@@ -1914,7 +1989,9 @@ class GuessSongPlugin(Star):  # type: ignore
                 return
 
             user_id = event.get_sender_id()
-            if not self._can_listen_song(user_id):
+            loop = asyncio.get_running_loop()
+            can_listen = await loop.run_in_executor(self.executor, self._can_listen_song_sync, user_id)
+            if not can_listen:
                 limit = self.config.get('daily_listen_limit', 5)
                 yield event.plain_result(f"......你今天听歌的次数已达上限（{limit}次），请明天再来吧......")
                 return
@@ -1998,7 +2075,8 @@ class GuessSongPlugin(Star):  # type: ignore
             yield event.chain_result(msg_chain)
             yield event.chain_result([Comp.Record(file=str(mp3_source))])
 
-            self._record_listen_song(user_id, event.get_sender_name())
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(self.executor, self._record_listen_song, user_id, event.get_sender_name())
             self.last_game_end_time[session_id] = time.time()
 
         except Exception as e:
@@ -2066,3 +2144,26 @@ class GuessSongPlugin(Star):  # type: ignore
                 pass  # We just need the request to be made.
         except Exception as e:
             logger.warning(f"Stats ping to {ping_url} failed: {e}")
+
+    def _can_listen_song_sync(self, user_id: str) -> bool:
+        """[Helper] 同步检查听歌次数"""
+        daily_limit = self.config.get("daily_listen_limit", 5)
+        with self.get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT daily_listen_plays, last_play_date FROM user_stats WHERE user_id = ?", (user_id,))
+            user_data = cursor.fetchone()
+            return not (user_data and user_data[1] == time.strftime("%Y-%m-%d") and user_data[0] >= daily_limit)
+
+    def _get_user_score_data_sync(self, user_id: str) -> Optional[tuple]:
+        """[Helper] 同步获取用户分数数据"""
+        with self.get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT score, attempts, correct_attempts, last_play_date, daily_plays FROM user_stats WHERE user_id = ?", (user_id,))
+            user_data = cursor.fetchone()
+            if not user_data:
+                return None
+            
+            score = user_data[0]
+            cursor.execute("SELECT COUNT(*) FROM user_stats WHERE score > ?", (score,))
+            rank = cursor.fetchone()[0] + 1
+            return user_data + (rank,)
