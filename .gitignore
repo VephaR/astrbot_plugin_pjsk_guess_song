@@ -221,4 +221,3 @@ resources/*
 !resources/characters.json
 !resources/guess_song.json
 !resources/ranking_bg.png
-!resources\music_jacket
