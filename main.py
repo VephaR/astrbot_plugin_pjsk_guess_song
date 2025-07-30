@@ -18,8 +18,6 @@ import traceback
 import itertools
 from functools import partial
 from concurrent.futures import ThreadPoolExecutor
-from urllib.request import urlopen # 新增
-from urllib.error import URLError # 新增
 from urllib.parse import urlparse
 
 try:
