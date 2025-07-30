@@ -23,6 +23,13 @@ from urllib.error import URLError # 新增
 from urllib.parse import urlparse
 
 try:
+    import aiohttp
+    AIOHTTP_AVAILABLE = True
+except ImportError:
+    aiohttp = None
+    AIOHTTP_AVAILABLE = False
+
+try:
     from pydub import AudioSegment
     PYDUB_AVAILABLE = True
 except ImportError:
@@ -34,14 +41,13 @@ try:
 except ImportError:
     LANCZOS = 1
 
-try:
-    from astrbot.api import logger
-except ImportError:
-    logger = logging.getLogger(__name__)
+
+from astrbot.api import logger
+
 
 try:
     from astrbot.api.event import filter, AstrMessageEvent
-    from astrbot.api.star import Context, Star, register
+    from astrbot.api.star import Context, Star, register, StarTools
     import astrbot.api.message_components as Comp
     from astrbot.core.utils.session_waiter import session_waiter, SessionController
     from astrbot.api import AstrBotConfig
@@ -50,6 +56,13 @@ except ImportError:
     from astrbot.core.plugin import Plugin as Star, Context, register, filter, AstrMessageEvent  # type: ignore
     import astrbot.core.message_components as Comp  # type: ignore
     from astrbot.core.utils.session_waiter import session_waiter, SessionController  # type: ignore
+    # Fallback for StarTools if it's missing in older versions
+    class StarTools:
+        @staticmethod
+        def get_data_dir(plugin_name: str) -> Path:
+            # Provide a fallback implementation that mimics the original get_db_path logic
+            # This path is relative to the directory containing the 'plugins' folder
+            return Path(__file__).parent.parent.parent.parent / 'data' / 'plugins_data' / plugin_name
 
 
 # --- 插件元数据 ---
@@ -63,13 +76,7 @@ PLUGIN_REPO_URL = "https://github.com/nichinichisou0609/astrbot_plugin_pjsk_gues
 # --- 数据库管理 ---
 def get_db_path(context: Context, plugin_dir: Path) -> str:
     """获取插件的数据库文件路径"""
-    config = context.get_config()
-    data_path = config.get('data_path')
-    if not data_path:
-        logger.warning("'data_path' not found in config. Falling back to .../data/ directory.")
-        data_path = plugin_dir.parent.parent
-
-    plugin_data_dir = Path(str(data_path)) / 'plugins_data' / PLUGIN_NAME
+    plugin_data_dir = StarTools.get_data_dir(PLUGIN_NAME)
     os.makedirs(plugin_data_dir, exist_ok=True)
     return str(plugin_data_dir / "guess_song_data.db")
 
@@ -152,6 +159,7 @@ class GuessSongPlugin(Star):  # type: ignore
         self.songs_data = load_song_data(self.resources_dir)
         self.character_map = load_character_data(self.resources_dir)
         self.last_game_end_time = {}
+        self.http_session: Optional['aiohttp.ClientSession'] = None
         self.available_piano_songs = []
         self.available_accompaniment_songs = []
         self.available_vocals_songs = []
@@ -207,67 +215,13 @@ class GuessSongPlugin(Star):  # type: ignore
         use_local = self.config.get("use_local_resources", True)
 
         if use_local:
-            logger.info("使用本地资源模式，开始扫描文件系统...")
-            for mode in self.preprocessed_tracks.keys():
-                mode_dir = self.resources_dir / mode
-                if mode_dir.exists():
-                    for mp3_file in mode_dir.glob("*.mp3"):
-                        self.preprocessed_tracks[mode].add(mp3_file.stem)
-                    logger.info(f"成功加载 {len(self.preprocessed_tracks[mode])} 个 '{mode}' 模式的本地音轨。")
-            
-            trimmed_mp3_dir = self.resources_dir / "songs_piano_trimmed_mp3"
-            if trimmed_mp3_dir.exists():
-                for mp3_path in trimmed_mp3_dir.glob("**/*.mp3"):
-                    self.available_piano_songs_bundles.add(mp3_path.parent.name)
-                logger.info(f"成功加载 {len(self.available_piano_songs_bundles)} 个钢琴模式的本地音轨。")
+            self._load_local_manifest()
         else:
-            logger.info("使用远程资源模式，开始获取 manifest.json...")
-            manifest_url = self._get_resource_path_or_url("manifest.json")
-            if manifest_url and isinstance(manifest_url, str):
-                try:
-                    with urlopen(manifest_url, timeout=10) as response:
-                        manifest_data = json.load(response)
-                        
-                        for mode in self.preprocessed_tracks.keys():
-                            self.preprocessed_tracks[mode] = set(manifest_data.get(mode, []))
-                            logger.info(f"成功从 manifest 加载 {len(self.preprocessed_tracks[mode])} 个 '{mode}' 模式的音轨。")
-                        
-                        self.available_piano_songs_bundles = set(manifest_data.get("songs_piano_trimmed_mp3", []))
-                        logger.info(f"成功从 manifest 加载 {len(self.available_piano_songs_bundles)} 个钢琴模式的音轨。")
-
-                except (URLError, json.JSONDecodeError, Exception) as e:
-                    logger.error(f"获取或解析远程 manifest.json 失败: {e}。插件将无法使用预处理音轨模式。", exc_info=True)
-            else:
-                 logger.error("无法构建 manifest.json 的 URL。插件将无法使用预处理音轨模式。")
+            logger.info("使用远程资源模式，将在后台获取 manifest.json...")
+            asyncio.create_task(self._load_remote_manifest())
 
         # --- 根据加载的音轨信息，填充可用的歌曲列表 ---
-        if self.songs_data:
-            song_list_map = {
-                'accompaniment': (self.available_accompaniment_songs, set()),
-                'vocals_only': (self.available_vocals_songs, set()),
-                'bass_only': (self.available_bass_songs, set()),
-                'drums_only': (self.available_drums_songs, set()),
-            }
-
-            for mode, bundles in self.preprocessed_tracks.items():
-                # 注意：这里需要检查 key 是否存在
-                if mode in song_list_map:
-                    song_list, processed_ids = song_list_map[mode]
-                    for bundle_name in bundles:
-                        if bundle_name in self.bundle_to_song_map:
-                            song = self.bundle_to_song_map[bundle_name]
-                            if song['id'] not in processed_ids:
-                                song_list.append(song)
-                                processed_ids.add(song['id'])
-            
-            piano_processed_ids = set()
-            for bundle_name in self.available_piano_songs_bundles:
-                if bundle_name in self.bundle_to_song_map:
-                    song = self.bundle_to_song_map[bundle_name]
-                    if song['id'] not in piano_processed_ids:
-                        self.available_piano_songs.append(song)
-                        piano_processed_ids.add(song['id'])
-            logger.info(f"找到了 {len(self.available_piano_songs)} 首拥有预生成MP3的歌曲。")
+        self._populate_song_lists()
 
         # 筛选出有 another_vocal 的歌曲
         self.another_vocal_songs = []
@@ -285,11 +239,106 @@ class GuessSongPlugin(Star):  # type: ignore
         if not PYDUB_AVAILABLE:
             logger.error("音频处理库 'pydub' 未找到。猜歌功能将无法使用。请运行 'pip install pydub' 并确保已安装 'ffmpeg'。")
             
+        if not AIOHTTP_AVAILABLE:
+            logger.warning("`aiohttp` 模块未安装，远程资源功能将受限或无法使用。建议安装: pip install aiohttp")
+
         os.makedirs(self.output_dir, exist_ok=True)
         # 启动时清理一次
         self._cleanup_output_dir()
         # --- 新增：启动周期性清理任务 ---
         self._cleanup_task = asyncio.create_task(self._periodic_cleanup_task())
+
+    async def _get_session(self) -> Optional['aiohttp.ClientSession']:
+        """延迟初始化并获取 aiohttp session"""
+        if not AIOHTTP_AVAILABLE:
+            return None
+        if self.http_session is None or self.http_session.closed:
+            self.http_session = aiohttp.ClientSession()
+        return self.http_session
+
+    def _load_local_manifest(self):
+        """同步加载本地资源清单。"""
+        logger.info("使用本地资源模式，开始扫描文件系统...")
+        for mode in self.preprocessed_tracks.keys():
+            mode_dir = self.resources_dir / mode
+            if mode_dir.exists():
+                for mp3_file in mode_dir.glob("*.mp3"):
+                    self.preprocessed_tracks[mode].add(mp3_file.stem)
+                logger.info(f"成功加载 {len(self.preprocessed_tracks[mode])} 个 '{mode}' 模式的本地音轨。")
+        
+        trimmed_mp3_dir = self.resources_dir / "songs_piano_trimmed_mp3"
+        if trimmed_mp3_dir.exists():
+            for mp3_path in trimmed_mp3_dir.glob("**/*.mp3"):
+                self.available_piano_songs_bundles.add(mp3_path.parent.name)
+            logger.info(f"成功加载 {len(self.available_piano_songs_bundles)} 个钢琴模式的本地音轨。")
+        self._populate_song_lists() # 加载完后填充列表
+
+    async def _load_remote_manifest(self):
+        """异步加载远程资源清单。"""
+        logger.info("使用远程资源模式，开始获取 manifest.json...")
+        manifest_url = self._get_resource_path_or_url("manifest.json")
+        if not manifest_url or not isinstance(manifest_url, str):
+            logger.error("无法构建 manifest.json 的 URL。插件将无法使用预处理音轨模式。")
+            return
+
+        try:
+            session = await self._get_session()
+            if not session:
+                logger.error("aiohttp session 不可用，无法获取远程 manifest。")
+                return
+
+            async with session.get(manifest_url, timeout=10) as response:
+                response.raise_for_status()
+                manifest_data = await response.json()
+                
+                for mode in self.preprocessed_tracks.keys():
+                    self.preprocessed_tracks[mode] = set(manifest_data.get(mode, []))
+                    logger.info(f"成功从 manifest 加载 {len(self.preprocessed_tracks[mode])} 个 '{mode}' 模式的音轨。")
+                
+                self.available_piano_songs_bundles = set(manifest_data.get("songs_piano_trimmed_mp3", []))
+                logger.info(f"成功从 manifest 加载 {len(self.available_piano_songs_bundles)} 个钢琴模式的音轨。")
+                self._populate_song_lists() # 加载完后填充列表
+
+        except Exception as e:
+            logger.error(f"获取或解析远程 manifest.json 失败: {e}。插件将无法使用预处理音轨模式。", exc_info=True)
+
+    def _populate_song_lists(self):
+        """根据已加载的音轨信息，填充可用的歌曲列表。"""
+        if not self.songs_data:
+            return
+            
+        # 清空旧列表以支持重载
+        self.available_accompaniment_songs.clear()
+        self.available_vocals_songs.clear()
+        self.available_bass_songs.clear()
+        self.available_drums_songs.clear()
+        self.available_piano_songs.clear()
+
+        song_list_map = {
+            'accompaniment': (self.available_accompaniment_songs, set()),
+            'vocals_only': (self.available_vocals_songs, set()),
+            'bass_only': (self.available_bass_songs, set()),
+            'drums_only': (self.available_drums_songs, set()),
+        }
+
+        for mode, bundles in self.preprocessed_tracks.items():
+            if mode in song_list_map:
+                song_list, processed_ids = song_list_map[mode]
+                for bundle_name in bundles:
+                    if bundle_name in self.bundle_to_song_map:
+                        song = self.bundle_to_song_map[bundle_name]
+                        if song['id'] not in processed_ids:
+                            song_list.append(song)
+                            processed_ids.add(song['id'])
+        
+        piano_processed_ids = set()
+        for bundle_name in self.available_piano_songs_bundles:
+            if bundle_name in self.bundle_to_song_map:
+                song = self.bundle_to_song_map[bundle_name]
+                if song['id'] not in piano_processed_ids:
+                    self.available_piano_songs.append(song)
+                    piano_processed_ids.add(song['id'])
+        logger.info(f"找到了 {len(self.available_piano_songs)} 首拥有预生成MP3的歌曲。")
 
     async def _periodic_cleanup_task(self):
         """每隔一小时自动清理一次 output 目录。"""
@@ -320,23 +369,26 @@ class GuessSongPlugin(Star):  # type: ignore
             # 使用posix风格的路径构建URL，以确保跨平台兼容性
             return f"{base_url}/{'/'.join(Path(relative_path).parts)}"
 
-    def _open_image(self, relative_path: str) -> Optional[Image.Image]:
+    async def _open_image(self, relative_path: str) -> Optional[Image.Image]:
         """打开一个资源图片，无论是本地路径还是远程URL。"""
         source = self._get_resource_path_or_url(relative_path)
         if not source:
             return None
         
         try:
-            # 如果 source 是字符串且以 http 开头，则视为URL
             if isinstance(source, str) and source.startswith(('http://', 'https://')):
-                with urlopen(source) as response:
-                    img = Image.open(response)
-                    # 必须在 with 块结束前加载图像数据，否则文件流会关闭
-                    img.load() 
+                session = await self._get_session()
+                if not session:
+                    logger.error("aiohttp session is not available.")
+                    return None
+                async with session.get(source) as response:
+                    response.raise_for_status()
+                    image_data = await response.read()
+                    img = Image.open(io.BytesIO(image_data))
                     return img
-            else: # 否则，视为本地 Path 对象
+            else:
                 return Image.open(source)
-        except (URLError, Exception) as e:
+        except Exception as e:
             logger.error(f"无法打开图片资源 {source}: {e}", exc_info=True)
             return None
 
@@ -368,7 +420,7 @@ class GuessSongPlugin(Star):  # type: ignore
     def get_conn(self) -> sqlite3.Connection:
         return sqlite3.connect(self.db_path)
 
-    def _create_options_image(self, options: List[Dict]) -> Optional[str]:
+    async def _create_options_image(self, options: List[Dict]) -> Optional[str]:
         """为12个歌曲选项创建一个3x4的图鉴"""
         if not options or len(options) != 12:
             return None
@@ -403,7 +455,7 @@ class GuessSongPlugin(Star):  # type: ignore
 
             try:
                 relative_jacket_path = f"music_jacket/{option['jacketAssetbundleName']}.png"
-                jacket_img = self._open_image(relative_jacket_path)
+                jacket_img = await self._open_image(relative_jacket_path)
                 if not jacket_img: continue
                 
                 jacket = jacket_img.convert("RGBA").resize((jacket_w, jacket_h), LANCZOS)
@@ -457,7 +509,7 @@ class GuessSongPlugin(Star):  # type: ignore
                     os.remove(file_path)
                     logger.info(f"已清理旧的输出文件: {filename}")
 
-    def start_new_game(self, **kwargs) -> Optional[Dict]:
+    async def start_new_game(self, **kwargs) -> Optional[Dict]:
         """
         准备一轮新游戏。
         该函数现在会智能选择处理路径：
@@ -567,6 +619,7 @@ class GuessSongPlugin(Star):  # type: ignore
         use_slow_path = is_bass_boost or has_speed_change or has_reverse or has_band_pass
 
         # --- 音频处理 ---
+        loop = asyncio.get_running_loop()
         # 路径A: 快速路径 (直接使用ffmpeg，性能高)
         if not use_slow_path:
             try:
@@ -602,7 +655,9 @@ class GuessSongPlugin(Star):  # type: ignore
                     '-y', str(clip_path_obj)
                 ]
                 
-                result = subprocess.run(command, capture_output=True, text=True, check=True, encoding='utf-8')
+                run_subprocess = partial(subprocess.run, command, capture_output=True, text=True, check=True, encoding='utf-8')
+                result = await loop.run_in_executor(self.executor, run_subprocess)
+
                 if result.returncode != 0:
                     raise RuntimeError(f"ffmpeg clipping failed: {result.stderr}")
                 
@@ -617,24 +672,67 @@ class GuessSongPlugin(Star):  # type: ignore
         
         # 路径B: 慢速路径 (使用pydub，兼容复杂效果)
         try:
-            # --- 修正：为 pydub 处理远程URL ---
+            audio_data: Union[str, Path, io.BytesIO]
             if isinstance(audio_source, str) and audio_source.startswith(('http://', 'https://')):
-                # pydub不能直接打开URL，所以我们先下载到内存中
-                with urlopen(audio_source) as response:
-                    buffer = io.BytesIO(response.read())
-                audio = AudioSegment.from_file(buffer, format=audio_format)
+                session = await self._get_session()
+                if not session:
+                    logger.error("aiohttp session不可用，无法下载远程音频。")
+                    return None
+                async with session.get(audio_source) as response:
+                    response.raise_for_status()
+                    audio_data = io.BytesIO(await response.read())
             else:
-                # 本地文件路径，pydub可以直接处理
-                audio = AudioSegment.from_file(audio_source, format=audio_format)
+                audio_data = audio_source
 
+            pydub_kwargs = {
+                "preprocessed_mode": preprocessed_mode,
+                "target_duration_seconds": self.config.get("clip_duration_seconds", 10),
+                "speed_multiplier": kwargs.get("speed_multiplier", 1.0),
+                "reverse_audio": kwargs.get("reverse_audio", False),
+                "band_pass": kwargs.get("band_pass"),
+                "is_piano_mode": is_piano_mode,
+                "song_filler_sec": song.get("fillerSec", 0)
+            }
+            
+            # 将pydub的CPU密集型操作放入线程池
+            clip = await loop.run_in_executor(
+                self.executor,
+                self._process_audio_with_pydub,
+                audio_data,
+                audio_format,
+                pydub_kwargs
+            )
+
+            if clip is None:
+                raise RuntimeError("pydub audio processing failed.")
+
+            mode = "normal"
+            if preprocessed_mode: mode = preprocessed_mode
+            elif is_piano_mode: mode = "melody_to_piano"
+            
+            clip_path = self.output_dir / f"clip_{int(time.time())}.mp3"
+            clip.export(clip_path, format="mp3", bitrate="128k")
+
+            return {"song": song, "clip_path": str(clip_path), "score": kwargs.get("score", 1), "mode": mode}
+
+        except Exception as e:
+            logger.error(f"慢速路径 (pydub) 处理音频文件 {audio_source} 时失败: {e}", exc_info=True)
+            return None
+
+    def _process_audio_with_pydub(self, audio_data: Union[str, Path, io.BytesIO], audio_format: str, options: dict) -> Optional['AudioSegment']:
+        """[Helper] 在线程池中执行的同步pydub处理逻辑"""
+        try:
+            audio = AudioSegment.from_file(audio_data, format=audio_format)
+
+            preprocessed_mode = options.get("preprocessed_mode")
             if preprocessed_mode == "bass_only":
                 audio += 6
 
-            target_duration_ms = int(self.config.get("clip_duration_seconds", 10) * 1000)
+            target_duration_ms = int(options.get("target_duration_seconds", 10) * 1000)
             if preprocessed_mode in ["bass_only", "drums_only"]:
                 target_duration_ms *= 2
             
-            speed_multiplier = kwargs.get("speed_multiplier", 1.0)
+            speed_multiplier = options.get("speed_multiplier", 1.0)
             source_duration_ms = int(target_duration_ms * speed_multiplier)
             total_duration_ms = len(audio)
             
@@ -642,8 +740,8 @@ class GuessSongPlugin(Star):  # type: ignore
                 clip_segment = audio
             else:
                 start_range_min = 0
-                if not preprocessed_mode and not is_piano_mode:
-                    start_range_min = int(song.get("fillerSec", 0) * 1000)
+                if not preprocessed_mode and not options.get("is_piano_mode"):
+                    start_range_min = int(options.get("song_filler_sec", 0) * 1000)
                 
                 start_range_max = total_duration_ms - source_duration_ms
                 start_ms = random.randint(start_range_min, start_range_max) if start_range_min < start_range_max else start_range_min
@@ -654,30 +752,17 @@ class GuessSongPlugin(Star):  # type: ignore
             
             if speed_multiplier != 1.0:
                 clip = clip._spawn(clip.raw_data, overrides={'frame_rate': int(clip.frame_rate * speed_multiplier)})
-            if kwargs.get("reverse_audio", False):
+            if options.get("reverse_audio", False):
                 clip = clip.reverse()
             
-            if has_band_pass and isinstance(has_band_pass, tuple) and len(has_band_pass) == 2:
-                low_freq, high_freq = has_band_pass
+            band_pass = options.get("band_pass")
+            if band_pass and isinstance(band_pass, tuple) and len(band_pass) == 2:
+                low_freq, high_freq = band_pass
                 clip = clip.high_pass_filter(low_freq).low_pass_filter(high_freq) + 6
-
-            mode = "normal"
-            if preprocessed_mode: mode = preprocessed_mode
-            elif is_piano_mode: mode = "melody_to_piano"
-            elif has_band_pass: mode = "band_pass"
-            elif has_reverse: mode = "reverse"
-            elif has_speed_change: mode = "speedup"
             
-            if kwargs.get("random_mode_name"):
-                mode = kwargs["random_mode_name"]
-
-            clip_path = self.output_dir / f"clip_{int(time.time())}.mp3"
-            clip.export(clip_path, format="mp3", bitrate="128k")
-
-            return {"song": song, "clip_path": str(clip_path), "score": kwargs.get("score", 1), "mode": mode}
-
+            return clip
         except Exception as e:
-            logger.error(f"慢速路径 (pydub) 处理音频文件 {audio_source} 时失败: {e}", exc_info=True)
+            logger.error(f"Pydub processing in executor failed: {e}", exc_info=True)
             return None
 
     def _check_game_start_conditions(self, event: AstrMessageEvent) -> Tuple[bool, Optional[str]]:
@@ -828,13 +913,9 @@ class GuessSongPlugin(Star):  # type: ignore
         
         # 将同步的音频处理任务扔到线程池中执行
         try:
-            loop = asyncio.get_running_loop()
-            game_data_callable = partial(self.start_new_game, **kwargs)
-            game_data = await loop.run_in_executor(
-                self.executor, game_data_callable
-            )
+            game_data = await self.start_new_game(**kwargs)
         except Exception as e:
-            logger.error(f"在线程池中执行 start_new_game 失败: {e}", exc_info=True)
+            logger.error(f"执行 start_new_game 失败: {e}", exc_info=True)
             game_data = None
 
         if not game_data:
@@ -863,7 +944,7 @@ class GuessSongPlugin(Star):  # type: ignore
         logger.info(f"[猜歌插件] 新游戏开始. 答案: {correct_song['title']} (选项 {game_data['correct_answer_num']})")
         
         # 准备消息
-        options_img_path = self._create_options_image(options)
+        options_img_path = await self._create_options_image(options)
         timeout_seconds = self.config.get("answer_timeout", 30)
         intro_text = f".......嗯\n这首歌是？请在{timeout_seconds}秒内发送编号回答。\n"
         
@@ -1044,13 +1125,9 @@ class GuessSongPlugin(Star):  # type: ignore
         
         # 准备游戏数据
         try:
-            loop = asyncio.get_running_loop()
-            game_data_callable = partial(self.start_new_game, **combined_kwargs)
-            game_data = await loop.run_in_executor(
-                self.executor, game_data_callable
-            )
+            game_data = await self.start_new_game(**combined_kwargs)
         except Exception as e:
-            logger.error(f"在线程池中执行 start_new_game 失败: {e}", exc_info=True)
+            logger.error(f"执行 start_new_game 失败: {e}", exc_info=True)
             game_data = None
             
         if not game_data:
@@ -1077,7 +1154,7 @@ class GuessSongPlugin(Star):  # type: ignore
         
         logger.info(f"[猜歌插件] 新游戏开始. 答案: {correct_song['title']} (选项 {game_data['correct_answer_num']})")
         
-        options_img_path = self._create_options_image(options)
+        options_img_path = await self._create_options_image(options)
         timeout_seconds = self.config.get("answer_timeout", 30)
         intro_text = f".......嗯\n这首歌是？请在{timeout_seconds}秒内发送编号回答。\n"
         
@@ -1132,16 +1209,13 @@ class GuessSongPlugin(Star):  # type: ignore
         correct_vocal_version = random.choice(another_vocals)
         
         try:
-            loop = asyncio.get_running_loop()
-            game_data_callable = partial(
-                self.start_new_game,
+            game_data = await self.start_new_game(
                 force_song_object=song,
                 force_vocal_version=correct_vocal_version,
                 speed_multiplier=1.5
             )
-            game_data = await loop.run_in_executor(self.executor, game_data_callable)
         except Exception as e:
-            logger.error(f"在线程池中执行 start_new_game 失败: {e}", exc_info=True)
+            logger.error(f"执行 start_new_game 失败: {e}", exc_info=True)
             game_data = None
 
         if not game_data:
@@ -1189,7 +1263,7 @@ class GuessSongPlugin(Star):  # type: ignore
         if not self._is_group_allowed(event):
             return
         help_text = (
-            "--- 猜歌插件帮助 ---\n\n"
+            "--- PJSK猜歌插件帮助 ---\n\n"
             "🎵 基础指令\n"
             "  猜歌 - 普通模式 (1分)\n"
             "  猜歌 1 - 2倍速 (1分)\n"
@@ -1497,6 +1571,9 @@ class GuessSongPlugin(Star):  # type: ignore
         if self._cleanup_task:
             self._cleanup_task.cancel()
         self.executor.shutdown(wait=False)
+        if self.http_session and not self.http_session.closed:
+            await self.http_session.close()
+            logger.info("aiohttp session已关闭。")
         logger.info("猜歌插件已终止。")
         pass
 
@@ -1721,11 +1798,9 @@ class GuessSongPlugin(Star):  # type: ignore
 
         # --- 在线程池中执行游戏准备 ---
         try:
-            loop = asyncio.get_running_loop()
-            game_data_callable = partial(self.start_new_game, **final_kwargs)
-            game_data = await loop.run_in_executor(self.executor, game_data_callable)
+            game_data = await self.start_new_game(**final_kwargs)
         except Exception as e:
-            logger.error(f"测试模式下，在线程池中执行 start_new_game 失败: {e}", exc_info=True)
+            logger.error(f"测试模式下，执行 start_new_game 失败: {e}", exc_info=True)
             game_data = None
 
         if not game_data:
@@ -1739,7 +1814,7 @@ class GuessSongPlugin(Star):  # type: ignore
         random.shuffle(options)
         correct_answer_num = options.index(correct_song) + 1
 
-        options_img_path = self._create_options_image(options)
+        options_img_path = await self._create_options_image(options)
         
         effects_text = "、".join(sorted(list(set(effect_names)))) or "普通"
         intro_text = f"--- 测试模式 ---\n歌曲: {correct_song['title']}\n效果: {effects_text} (理论分数: {total_score})\n"
@@ -1974,6 +2049,11 @@ class GuessSongPlugin(Star):  # type: ignore
             return
 
         try:
+            session = await self._get_session()
+            if not session:
+                logger.warning("aiohttp not installed, cannot send stats ping.")
+                return
+
             # 从资源URL中提取协议和主机名，然后强制使用5000端口
             parsed_url = urlparse(resource_url_base)
             stats_server_root = f"{parsed_url.scheme}://{parsed_url.hostname}:5000"
@@ -1981,8 +2061,8 @@ class GuessSongPlugin(Star):  # type: ignore
             # 构建最终的统计请求URL
             ping_url = f"{stats_server_root}/stats_ping/{game_type}.ping"
 
-            # 在后台线程池中发送请求
-            loop = asyncio.get_running_loop()
-            loop.run_in_executor(self.executor, self._execute_ping_request, ping_url)
+            # 异步发送请求
+            async with session.get(ping_url, timeout=2):
+                pass # We just need the request to be made.
         except Exception as e:
-            logger.error(f"无法调度统计ping任务: {e}")
+            logger.warning(f"Stats ping to {ping_url} failed: {e}")
