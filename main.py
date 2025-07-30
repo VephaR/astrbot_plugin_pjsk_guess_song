@@ -4,7 +4,6 @@ import random
 import time
 import os
 import sqlite3
-import logging
 import re
 import subprocess  # 新增
 import io
@@ -231,6 +230,8 @@ class GuessSongPlugin(Star):  # type: ignore
         # 使用 context 初始化共享的游戏会话状态
         if not hasattr(self.context, "active_game_sessions"):
             self.context.active_game_sessions = set()
+        if not hasattr(self.context, "game_session_locks"):
+            self.context.game_session_locks = {}
 
         if not self.songs_data:
             logger.error("插件初始化失败，缺少歌曲数据文件。")
@@ -893,17 +894,20 @@ class GuessSongPlugin(Star):  # type: ignore
 
     async def _start_game_logic(self, event: AstrMessageEvent, **kwargs):
         """猜歌游戏核心逻辑(准备阶段)"""
-        can_start, message = self._check_game_start_conditions(event)
-        if not can_start:
-            if message:
-                await event.send(event.plain_result(message))
-            return
-
         session_id = event.unified_msg_origin
+        lock = self.context.game_session_locks.setdefault(session_id, asyncio.Lock())
+
+        async with lock:
+            can_start, message = self._check_game_start_conditions(event)
+            if not can_start:
+                if message:
+                    await event.send(event.plain_result(message))
+                return
+            # 在锁内标记会话
+            self.context.active_game_sessions.add(session_id)
+
         debug_mode = self.config.get("debug_mode", False)
 
-        # 标记会话并记录次数
-        self.context.active_game_sessions.add(session_id)
         # --- 新增：发送统计信标 ---
         asyncio.create_task(self._send_stats_ping("guess_song"))
         if not debug_mode:
@@ -989,17 +993,20 @@ class GuessSongPlugin(Star):  # type: ignore
     @filter.command("随机猜歌", alias={"rgs"})
     async def start_random_guess_song(self, event: AstrMessageEvent):
         """开始一轮随机特殊模式的猜歌，可能叠加多种效果"""
-        can_start, message = self._check_game_start_conditions(event)
-        if not can_start:
-            if message:
-                await event.send(event.plain_result(message))
-            return
-            
         session_id = event.unified_msg_origin
+        lock = self.context.game_session_locks.setdefault(session_id, asyncio.Lock())
+
+        async with lock:
+            can_start, message = self._check_game_start_conditions(event)
+            if not can_start:
+                if message:
+                    await event.send(event.plain_result(message))
+                return
+            # 在锁内标记会话
+            self.context.active_game_sessions.add(session_id)
+            
         debug_mode = self.config.get("debug_mode", False)
 
-        # 标记会话并记录次数
-        self.context.active_game_sessions.add(session_id)
         # --- 新增：为随机模式发送统计信标 ---
         asyncio.create_task(self._send_stats_ping("guess_song_random"))
         if not debug_mode:
@@ -1172,21 +1179,24 @@ class GuessSongPlugin(Star):  # type: ignore
     @filter.command("猜歌手")
     async def start_vocalist_game(self, event: AstrMessageEvent):
         """开始一轮 '猜歌手' 游戏"""
-        can_start, message = self._check_game_start_conditions(event)
-        if not can_start:
-            if message:
-                await event.send(event.plain_result(message))
-            return
-        
         if not self.another_vocal_songs:
             await event.send(event.plain_result("......抱歉，没有找到包含 another_vocal 的歌曲，无法开始游戏。"))
             return
-        
+
         session_id = event.unified_msg_origin
+        lock = self.context.game_session_locks.setdefault(session_id, asyncio.Lock())
+        
+        async with lock:
+            can_start, message = self._check_game_start_conditions(event)
+            if not can_start:
+                if message:
+                    await event.send(event.plain_result(message))
+                return
+            # 在锁内标记会话
+            self.context.active_game_sessions.add(session_id)
+        
         debug_mode = self.config.get("debug_mode", False)
 
-        # 标记会话并记录次数
-        self.context.active_game_sessions.add(session_id)
         # --- 新增：为猜歌手模式发送统计信标 ---
         asyncio.create_task(self._send_stats_ping("guess_song_vocalist"))
         if not debug_mode:
@@ -1891,27 +1901,30 @@ class GuessSongPlugin(Star):  # type: ignore
             return
 
         session_id = event.unified_msg_origin
-        cooldown = self.config.get("game_cooldown_seconds", 60)
+        lock = self.context.game_session_locks.setdefault(session_id, asyncio.Lock())
         
-        if time.time() - self.last_game_end_time.get(session_id, 0) < cooldown:
-            yield event.plain_result(f"嗯......休息 {int(cooldown - (time.time() - self.last_game_end_time.get(session_id, 0)))} 秒再玩吧......")
-            return
+        async with lock:
+            cooldown = self.config.get("game_cooldown_seconds", 60)
+            if time.time() - self.last_game_end_time.get(session_id, 0) < cooldown:
+                yield event.plain_result(f"嗯......休息 {int(cooldown - (time.time() - self.last_game_end_time.get(session_id, 0)))} 秒再玩吧......")
+                return
+                
+            if session_id in self.context.active_game_sessions:
+                yield event.plain_result("......有一个正在进行的游戏或播放任务了呢。")
+                return
+
+            user_id = event.get_sender_id()
+            if not self._can_listen_song(user_id):
+                limit = self.config.get('daily_listen_limit', 5)
+                yield event.plain_result(f"......你今天听歌的次数已达上限（{limit}次），请明天再来吧......")
+                return
             
-        if session_id in self.context.active_game_sessions:
-            yield event.plain_result("......有一个正在进行的游戏或播放任务了呢。")
-            return
-
-        user_id = event.get_sender_id()
-        user_name = event.get_sender_name()
-
-        if not self._can_listen_song(user_id):
-            limit = self.config.get('daily_listen_limit', 5)
-            yield event.plain_result(f"......你今天听歌的次数已达上限（{limit}次），请明天再来吧......")
-            return
-        
-        if not config['available_songs']:
-            yield event.plain_result(config['not_found_msg'])
-            return
+            if not config['available_songs']:
+                yield event.plain_result(config['not_found_msg'])
+                return
+            
+            # 所有检查通过后，在锁内标记会话
+            self.context.active_game_sessions.add(session_id)
 
         # --- 新增：为听歌模式发送统计信标 ---
         asyncio.create_task(self._send_stats_ping(f"listen_{mode}"))
@@ -1944,7 +1957,6 @@ class GuessSongPlugin(Star):  # type: ignore
             song_to_play = random.choice(config['available_songs'])
             
         # 4. 通用的会话处理和消息发送
-        self.context.active_game_sessions.add(session_id)
         try:
             song = song_to_play
             mp3_source: Optional[Union[Path, str]] = None
@@ -1986,7 +1998,7 @@ class GuessSongPlugin(Star):  # type: ignore
             yield event.chain_result(msg_chain)
             yield event.chain_result([Comp.Record(file=str(mp3_source))])
 
-            self._record_listen_song(user_id, user_name)
+            self._record_listen_song(user_id, event.get_sender_name())
             self.last_game_end_time[session_id] = time.time()
 
         except Exception as e:
@@ -2027,16 +2039,6 @@ class GuessSongPlugin(Star):  # type: ignore
         async for result in self._handle_listen_command(event, mode="drums"):
             yield result
 
-    def _execute_ping_request(self, ping_url: str):
-        """[Helper] Synchronous function to execute the ping request. Meant for ThreadPoolExecutor."""
-        try:
-            # urlopen is a blocking call, perfect for the executor.
-            with urlopen(ping_url, timeout=2):
-                pass  # We just need the request to be made.
-        except Exception as e:
-            # It's better to log this for debugging, even if we don't let it crash.
-            logger.warning(f"Stats ping to {ping_url} failed: {e}")
-
     async def _send_stats_ping(self, game_type: str):
         """(已重构) 向专用统计服务器的5000端口发送GET请求。"""
         if self.config.get("use_local_resources", True):
@@ -2061,6 +2063,6 @@ class GuessSongPlugin(Star):  # type: ignore
 
             # 异步发送请求
             async with session.get(ping_url, timeout=2):
-                pass # We just need the request to be made.
+                pass  # We just need the request to be made.
         except Exception as e:
             logger.warning(f"Stats ping to {ping_url} failed: {e}")
