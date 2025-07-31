@@ -1110,8 +1110,8 @@ class GuessSongPlugin(Star):  # type: ignore
             if has_reverse and has_speed_up:
                 current_score += 1
 
-            # 分数越高，权重越低 (已修改为1.5次幂，提供更平滑但仍有挑战的曲线)
-            weight = 1 / (current_score ** 1.5) if current_score > 0 else 1
+            # 分数越高，权重越低 (已修改为1次幂，提供更平滑但仍有挑战的曲线)
+            weight = 1 / (current_score ** 1) if current_score > 0 else 1
             final_combinations.append({
                 'kwargs': current_kwargs,
                 'score': current_score,
