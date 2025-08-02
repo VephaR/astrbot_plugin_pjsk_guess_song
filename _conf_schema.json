@@ -57,7 +57,6 @@
         "default": true,
         "description": "是否在奖励有效时间结束后立即结束游戏并公布答案。如果为 false，游戏将继续直到超时或达到最大尝试次数。"
     },
-
     "debug_mode": {
         "type": "bool",
         "default": false,
@@ -85,5 +84,11 @@
         "type": "bool",
         "default": false,
         "description": "轻量模式。启用后将禁用部分消耗CPU的音频处理功能（如变速、倒放），只保留从服务器直接下载裁剪的音频功能，以降低服务器负载。"
+    },
+    "stats_server_api_key": {
+        "description": "[可选] 全服统计服务器的API密钥",
+        "type": "string",
+        "default": "",
+        "hint": "用于连接全服排行榜和统计功能。请从服务器后台获取此密钥。留空则禁用所有联网功能。"
     }
 } 

@@ -18,6 +18,8 @@ import itertools
 from functools import partial
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse
+from urllib.request import urlopen
+from collections import defaultdict
 
 try:
     import aiohttp
@@ -79,46 +81,60 @@ def get_db_path(context: Context, plugin_dir: Path) -> str:
 
 
 def init_db(db_path: str):
-    """初始化数据库表"""
+    """初始化数据库，确保表结构兼容。"""
+    
     with sqlite3.connect(db_path) as conn:
         cursor = conn.cursor()
-        cursor.execute(
-            """
+
+        # 1. 创建核心表（如果不存在）
+        # 注意：user_stats 的 user_id 没有主键，以兼容旧数据库和新的 _update_stats 逻辑
+        cursor.execute("""
             CREATE TABLE IF NOT EXISTS user_stats (
-                user_id TEXT PRIMARY KEY,
+                user_id TEXT,
                 user_name TEXT,
                 score INTEGER DEFAULT 0,
                 attempts INTEGER DEFAULT 0,
                 correct_attempts INTEGER DEFAULT 0,
-                last_play_date TEXT,
-                daily_plays INTEGER DEFAULT 0
+                daily_games_played INTEGER DEFAULT 0,
+                last_played_date TEXT,
+                daily_listen_songs INTEGER DEFAULT 0,
+                last_listen_date TEXT
             )
-            """
-        )
-        # --- 统一的每日听歌次数 ---
-        try:
-            cursor.execute("ALTER TABLE user_stats ADD COLUMN daily_listen_plays INTEGER DEFAULT 0")
-        except sqlite3.OperationalError:
-            pass # 字段已存在
-            
-        # 移除旧的、分离的字段（如果存在）
-        # 注意：这在SQLite中比较复杂，通常我们选择不再使用它们
-        # 为简单起见，我们将保留旧字段，但代码逻辑不再使用
-
-        # 新增题型统计表
-        cursor.execute(
-            """
+        """)
+        cursor.execute("""
             CREATE TABLE IF NOT EXISTS mode_stats (
                 mode TEXT PRIMARY KEY,
-                total_attempts INTEGER DEFAULT 0,
+                attempts INTEGER DEFAULT 0,
                 correct_attempts INTEGER DEFAULT 0
             )
-            """
-        )
+        """)
         conn.commit()
 
+        # 2. 安全地添加新功能可能需要的列（如果不存在）
+        # 这是一个安全的"迁移"，可以防止因插件更新导致崩溃
+        try:
+            cursor.execute("PRAGMA table_info(user_stats);")
+            existing_columns = {row[1] for row in cursor.fetchall()}
+            columns_to_add = {
+                "daily_games_played": "INTEGER DEFAULT 0",
+                "last_played_date": "TEXT",
+                "daily_listen_songs": "INTEGER DEFAULT 0",
+                "last_listen_date": "TEXT",
+                "correct_streak": "INTEGER DEFAULT 0",
+                "max_correct_streak": "INTEGER DEFAULT 0",
+                "group_scores": "TEXT DEFAULT '{}'"
+            }
+            
+            for col, col_type in columns_to_add.items():
+                if col not in existing_columns:
+                    logger.info(f"向 user_stats 表添加新列以支持新功能: {col}")
+                    cursor.execute(f"ALTER TABLE user_stats ADD COLUMN {col} {col_type};")
+            conn.commit()
+        except sqlite3.Error as e:
+            logger.error(f"向 user_stats 添加列失败: {e}", exc_info=True)
+            conn.rollback()
 
-# --- 数据加载 ---
+
 def load_song_data(resources_dir: Path) -> Optional[List[Dict]]:
     """加载 guess_song.json 数据"""
     try:
@@ -147,105 +163,142 @@ def load_character_data(resources_dir: Path) -> Dict[str, str]:
 class GuessSongPlugin(Star):  # type: ignore
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
+        self.context = context
         self.config = config
-        self.plugin_dir = Path(os.path.dirname(__file__))
+        self.plugin_dir = Path(__file__).parent
+        
+        self.executor = ThreadPoolExecutor(max_workers=5)
+
         self.resources_dir = self.plugin_dir / "resources"
         self.output_dir = self.plugin_dir / "output"
+        os.makedirs(self.output_dir, exist_ok=True)
         self.db_path = get_db_path(context, self.plugin_dir)
         init_db(self.db_path)
-        self.songs_data = load_song_data(self.resources_dir)
-        self.character_map = load_character_data(self.resources_dir)
+
+        # Session and game management attributes
+        self.context.game_session_locks = getattr(self.context, "game_session_locks", {})
+        self.context.active_game_sessions = getattr(self.context, "active_game_sessions", set())
         self.last_game_end_time = {}
-        self.http_session: Optional['aiohttp.ClientSession'] = None
-        self.available_piano_songs = []
+        
+        # Song data and lists
+        self.song_data = load_song_data(self.resources_dir)
+        self.character_data = load_character_data(self.resources_dir)
+
+        self.random_mode_decay_factor = self.config.get("random_mode_decay_factor", 0.75)
+        
+        self.available_songs = []
+        self.available_vocalist_songs = []
+        self.bundle_to_song_map = {}
+        if self.song_data:
+            for song_item in self.song_data:
+                self.available_songs.append(song_item)
+                if song_item.get("vocalists"):
+                    self.available_vocalist_songs.append(song_item)
+                if 'vocals' in song_item and song_item['vocals']:
+                    for vocal in song_item['vocals']:
+                        bundle_name = vocal.get('vocalAssetbundleName')
+                        if bundle_name:
+                            self.bundle_to_song_map[bundle_name] = song_item
+
         self.available_accompaniment_songs = []
-        self.available_vocals_songs = []
+        self.available_piano_songs = []
         self.available_bass_songs = []
         self.available_drums_songs = []
-        self.bundle_to_song_map = {}
-
-        # --- 新增：为所有固定游戏模式创建配置映射 ---
-        self.game_modes = {
-            # Key `None` for the base command '猜歌'
-            None: {'kwargs': {'score': 1}},
-            "1": {'kwargs': {'speed_multiplier': 2.0, 'score': 1}},
-            "2": {'kwargs': {'reverse_audio': True, 'score': 3}},
-            "3": {'kwargs': {'melody_to_piano': True, 'score': 2}},
-            "4": {'kwargs': {'play_preprocessed': 'accompaniment', 'score': 1}},
-            "5": {'kwargs': {'play_preprocessed': 'bass_only', 'score': 3}},
-            "6": {'kwargs': {'play_preprocessed': 'drums_only', 'score': 4}},
-            "7": {'kwargs': {'play_preprocessed': 'vocals_only', 'score': 1}},
-        }
-
-        # 新增：模式名到模式编号的映射，方便测试指令使用
-        self.mode_name_map = {
-            'speed': '1', '2倍速': '1', 'speedup': '1',
-            'reverse': '2', '倒放': '2',
-            'piano': '3', '钢琴': '3',
-            'accompaniment': '4', '伴奏': '4',
-            'bass': '5', '贝斯': '5',
-            'drums': '6', '鼓组': '6',
-            'vocals': '7', '人声': '7',
-        }
-
-        # --- 新增：创建受控的线程池 ---
-        # 对于CPU密集型任务，将工作线程数限制为1，以避免在低核心CPU上发生线程争抢。
-        # 所有耗时的音频处理都将在这个队列中排队执行。
-        self.executor = ThreadPoolExecutor(max_workers=1)
-
-        # --- 新增：初始化后台任务句柄 ---
-        self._cleanup_task = None
-
-        # --- 新增：为所有歌曲版本创建 bundle_name -> song 的映射，提高查找效率 ---
-        if self.songs_data:
-            for song in self.songs_data:
-                for v in song.get('vocals', []):
-                    self.bundle_to_song_map[v['vocalAssetbundleName']] = song
-        
-        # --- 改造：根据配置扫描本地或拉取远程 manifest 来加载可用音轨 ---
+        self.available_vocals_songs = []
+        self.another_vocal_songs = []
+        self.available_piano_songs_bundles = set()
         self.preprocessed_tracks = {
             "accompaniment": set(), "bass_only": set(),
             "drums_only": set(), "vocals_only": set()
         }
-        self.available_piano_songs_bundles = set()
-
-        use_local = self.config.get("use_local_resources", True)
-
-        if use_local:
-            self._load_local_manifest()
-        else:
-            logger.info("使用远程资源模式，将在后台获取 manifest.json...")
-            asyncio.create_task(self._load_remote_manifest())
-
-        # --- 根据加载的音轨信息，填充可用的歌曲列表 ---
-        self._populate_song_lists()
-
-        # 筛选出有 another_vocal 的歌曲
-        self.another_vocal_songs = []
-        if self.songs_data:
-            for song in self.songs_data:
-                if any(v.get('musicVocalType') == 'another_vocal' for v in song.get('vocals', [])):
-                    self.another_vocal_songs.append(song)
         
-        # 使用 context 初始化共享的游戏会话状态
-        if not hasattr(self.context, "active_game_sessions"):
-            self.context.active_game_sessions = set()
-        if not hasattr(self.context, "game_session_locks"):
-            self.context.game_session_locks = {}
+        # --- 核心修复：直接从 self.config 读取插件配置 ---
+        self.group_whitelist = self.config.get("group_whitelist", [])
+        self.group_blacklist = self.config.get("group_blacklist", [])
+        self.max_plays_per_day = self.config.get("max_plays_per_day", 10)
+        self.max_listen_per_day = self.config.get("max_listen_per_day", 10)
+        self.game_cooldown_seconds = self.config.get("game_cooldown_seconds", 30)
 
-        if not self.songs_data:
-            logger.error("插件初始化失败，缺少歌曲数据文件。")
-        if not PYDUB_AVAILABLE:
-            logger.error("音频处理库 'pydub' 未找到。猜歌功能将无法使用。请运行 'pip install pydub' 并确保已安装 'ffmpeg'。")
-            
-        if not AIOHTTP_AVAILABLE:
-            logger.warning("`aiohttp` 模块未安装，远程资源功能将受限或无法使用。建议安装: pip install aiohttp")
+        # Remote resources and manifest
+        self.remote_manifest_url = self.config.get("remote_manifest_url")
+        self.preprocessed_assets_url = self.config.get("preprocessed_assets_url")
+        self.use_remote_resources = bool(self.remote_manifest_url and self.preprocessed_assets_url)
+        self.manifest_data = {}
+        self.http_session: Optional['aiohttp.ClientSession'] = None
+        self.manifest_lock = asyncio.Lock()
 
-        os.makedirs(self.output_dir, exist_ok=True)
-        # 启动时清理一次
-        self._cleanup_output_dir()
-        # --- 新增：启动周期性清理任务 ---
+        # Stats server configuration (Corrected to read from self.config directly)
+        self.api_key = self.config.get("stats_server_api_key")
+        remote_url_base = self.config.get("remote_resource_url_base")
+        if remote_url_base:
+            try:
+                parsed_url = urlparse(remote_url_base)
+                # Assume stats server is on the same host but at port 5000
+                self.stats_server_url = f"{parsed_url.scheme}://{parsed_url.hostname}:5000"
+            except Exception as e:
+                logger.error(f"无法从 '{remote_url_base}' 解析统计服务器地址: {e}")
+                self.stats_server_url = None
+        else:
+            self.stats_server_url = None
+
+        self.game_effects = {
+            # 稳定ID: {显示名}
+            'speed_2x':   {'name': '2倍速'},
+            'reverse':    {'name': '倒放'},
+            'piano':      {'name': '钢琴'},
+            'acc':        {'name': '伴奏'},
+            'bass':       {'name': '纯贝斯'},
+            'drums':      {'name': '纯鼓组'},
+            'vocals':     {'name': '纯人声'},
+        }
+
+        # Game mode definitions
+        self.game_modes = {
+            '1': {'name': '普通', 'kwargs': {}, 'score': 1},
+            '2': {'name': '2倍速', 'kwargs': {'speed_multiplier': 2.0},'score': 1},
+            '3': {'name': '倒放', 'kwargs': {'reverse_audio': True},'score': 3},
+            '4': {'name': '纯人声', 'kwargs': {'play_preprocessed': 'vocals_only'}, 'score': 1},
+            '5': {'name': '纯贝斯', 'kwargs': {'play_preprocessed': 'bass_only'}, 'score': 3},
+            '6': {'name': '纯鼓组', 'kwargs': {'play_preprocessed': 'drums_only'}, 'score': 4},
+            '7': {'name': '纯伴奏', 'kwargs': {'play_preprocessed': 'accompaniment'}, 'score': 1}
+        }
+        
+        # Effects for random mode, deduced from game_modes and random guesser logic
+        self.base_effects = [
+            {'name': '2倍速', 'kwargs': {'speed_multiplier': 2.0}, 'group': 'speed', 'score': 1},
+            {'name': '倒放', 'kwargs': {'reverse_audio': True}, 'group': 'direction', 'score': 3},
+        ]
+        self.source_effects = [
+            {'name': 'Twin Piano ver.', 'kwargs': {'melody_to_piano': True}, 'group': 'source', 'score': 2},
+            {'name': '纯人声', 'kwargs': {'play_preprocessed': 'vocals_only'}, 'group': 'source', 'score': 1},
+            {'name': '纯贝斯', 'kwargs': {'play_preprocessed': 'bass_only'}, 'group': 'source', 'score': 3},
+            {'name': '纯鼓组', 'kwargs': {'play_preprocessed': 'drums_only'}, 'group': 'source', 'score': 4},
+            {'name': '纯伴奏', 'kwargs': {'play_preprocessed': 'accompaniment'}, 'group': 'source', 'score': 1}
+        ]
+
+        self.listen_modes = {
+            "piano": {"name": "钢琴", "list_attr": "available_piano_songs", "file_key": "piano"},
+            "karaoke": {"name": "伴奏", "list_attr": "available_accompaniment_songs", "file_key": "accompaniment"},
+            "vocals": {"name": "人声", "list_attr": "available_vocals_songs", "file_key": "vocals_only"},
+            "bass": {"name": "贝斯", "list_attr": "available_bass_songs", "file_key": "bass_only"},
+            "drums": {"name": "鼓组", "list_attr": "available_drums_songs", "file_key": "drums_only"},
+        }
+        self.mode_name_map = {}
+        for key, value in self.game_modes.items():
+            self.mode_name_map[key] = key
+            self.mode_name_map[value['name'].lower()] = key
+        for key, value in self.game_effects.items():
+            self.mode_name_map[key] = key
+            self.mode_name_map[value['name'].lower()] = key
+        
+        # Final setup
+        if self.song_data:
+            self._populate_song_lists()
+        else:
+            logger.error("歌曲数据加载失败，插件部分功能可能无法使用。")
+
         self._cleanup_task = asyncio.create_task(self._periodic_cleanup_task())
+        self._manifest_load_task = asyncio.create_task(self._load_remote_manifest())
 
     async def _get_session(self) -> Optional['aiohttp.ClientSession']:
         """延迟初始化并获取 aiohttp session"""
@@ -303,7 +356,7 @@ class GuessSongPlugin(Star):  # type: ignore
 
     def _populate_song_lists(self):
         """根据已加载的音轨信息，填充可用的歌曲列表。"""
-        if not self.songs_data:
+        if not self.song_data:
             return
             
         # 清空旧列表以支持重载
@@ -526,7 +579,7 @@ class GuessSongPlugin(Star):  # type: ignore
         - 快速路径：对简单裁剪任务直接使用ffmpeg，性能更高。
         - 慢速路径：对需要变速、倒放等复杂效果的任务，使用pydub。
         """
-        if not self.songs_data or not PYDUB_AVAILABLE:
+        if not self.song_data or not PYDUB_AVAILABLE:
             logger.error("无法开始游戏: 歌曲数据未加载或pydub未安装。")
             return None
 
@@ -554,7 +607,7 @@ class GuessSongPlugin(Star):  # type: ignore
                     return None
                 song = random.choice(self.available_piano_songs)
             else:
-                song = random.choice(self.songs_data)
+                song = random.choice(self.song_data)
         
         if not song:
             logger.error("在游戏准备的步骤一中未能确定歌曲。")
@@ -671,9 +724,14 @@ class GuessSongPlugin(Star):  # type: ignore
                 if result.returncode != 0:
                     raise RuntimeError(f"ffmpeg clipping failed: {result.stderr}")
                 
+                # 修正：优先使用随机模式的名称
                 mode = "normal"
-                if preprocessed_mode: mode = preprocessed_mode
-                elif is_piano_mode: mode = "melody_to_piano"
+                if kwargs.get("random_mode_name"):
+                    mode = kwargs["random_mode_name"]
+                elif preprocessed_mode:
+                    mode = preprocessed_mode
+                elif is_piano_mode:
+                    mode = "melody_to_piano"
                 
                 return {"song": song, "clip_path": str(clip_path_obj), "score": kwargs.get("score", 1), "mode": mode}
 
@@ -716,9 +774,14 @@ class GuessSongPlugin(Star):  # type: ignore
             if clip is None:
                 raise RuntimeError("pydub audio processing failed.")
 
+            # 修正：优先使用随机模式的名称
             mode = "normal"
-            if preprocessed_mode: mode = preprocessed_mode
-            elif is_piano_mode: mode = "melody_to_piano"
+            if kwargs.get("random_mode_name"):
+                mode = kwargs["random_mode_name"]
+            elif preprocessed_mode:
+                mode = preprocessed_mode
+            elif is_piano_mode:
+                mode = "melody_to_piano"
             
             clip_path = self.output_dir / f"clip_{int(time.time())}.mp3"
             clip.export(clip_path, format="mp3", bitrate="128k")
@@ -811,6 +874,7 @@ class GuessSongPlugin(Star):  # type: ignore
         guessed_users = set()
         guess_attempts_count = 0
         max_guess_attempts = self.config.get("max_guess_attempts", 10)
+        game_results_to_log = []
 
         try:
             await event.send(event.chain_result([Comp.Record(file=game_data["clip_path"])]))
@@ -864,10 +928,25 @@ class GuessSongPlugin(Star):  # type: ignore
                 if can_score:
                     score_to_add = game_data.get("score", 1)
 
-            if game_data.get("game_mode", "song") == "song":
+            if game_data.get("game_type", "guess_song") == "guess_song":
                 loop = asyncio.get_running_loop()
-                await loop.run_in_executor(self.executor, self._update_stats, user_id, user_name, score_to_add, is_correct)
-                await loop.run_in_executor(self.executor, self._update_mode_stats, game_data.get('mode', 'normal'), is_correct)
+                await loop.run_in_executor(self.executor, self._update_stats, session_id, user_id, user_name, score_to_add, is_correct)
+                if score_to_add > 0:
+                     asyncio.create_task(self._api_update_score(user_id, user_name, score_to_add))
+
+                # 修正：使用 game_data['mode'] 以确保随机模式的稳定ID被正确记录
+                await loop.run_in_executor(self.executor, self._update_mode_stats, game_data['mode'], is_correct)
+                
+                # 修改：将游戏结果暂存，游戏结束后统一发送
+                game_results_to_log.append({
+                    "game_type": 'guess_song',
+                    "game_mode": game_data['mode'], # 修正：同上
+                    "user_id": user_id,
+                    "user_name": user_name,
+                    "is_correct": is_correct,
+                    "score_awarded": score_to_add, # 修正：字段名以匹配服务器
+                    "session_id": session_id
+                })
 
             if is_correct and can_score:
                 if user_id not in correct_players:
@@ -896,6 +975,11 @@ class GuessSongPlugin(Star):  # type: ignore
             if session_id in self.context.active_game_sessions:
                 self.context.active_game_sessions.remove(session_id)
         
+        # 新增：在一轮游戏结束后，异步发送所有玩家的游戏数据
+        if game_results_to_log:
+            for result in game_results_to_log:
+                asyncio.create_task(self._api_log_game(result))
+        
         summary_prefix = f"本轮猜测已达上限({max_guess_attempts}次)！" if game_ended_by_attempts else "时间到！"
         if correct_players:
             winner_names = "、".join(player['name'] for player in correct_players.values())
@@ -908,34 +992,32 @@ class GuessSongPlugin(Star):  # type: ignore
         await event.send(event.chain_result(answer_reveal_messages))
 
     async def _start_game_logic(self, event: AstrMessageEvent, **kwargs):
-        """猜歌游戏核心逻辑(准备阶段)"""
+        """猜歌游戏核心逻辑(准备阶段)，已从旧代码恢复并适配"""
+        can_start, message = await self._check_game_start_conditions(event)
+        if not can_start:
+            if message:
+                await event.send(event.plain_result(message))
+            return
+
         session_id = event.unified_msg_origin
-        lock = self.context.game_session_locks.setdefault(session_id, asyncio.Lock())
-
-        async with lock:
-            can_start, message = await self._check_game_start_conditions(event)
-            if not can_start:
-                if message:
-                    await event.send(event.plain_result(message))
-                return
-            # 在锁内标记会话
-            self.context.active_game_sessions.add(session_id)
-
         debug_mode = self.config.get("debug_mode", False)
 
-        # --- 新增：发送统计信标 ---
+        # 标记会话并记录次数
+        self.context.active_game_sessions.add(session_id)
+        # --- 恢复：发送统计信标 ---
         asyncio.create_task(self._send_stats_ping("guess_song"))
         if not debug_mode:
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(
-                self.executor, self._record_game_start, event.get_sender_id(), event.get_sender_name()
-            )
+            self._record_game_start(event.get_sender_id(), event.get_sender_name())
         
         # 将同步的音频处理任务扔到线程池中执行
         try:
-            game_data = await self.start_new_game(**kwargs)
+            loop = asyncio.get_running_loop()
+            game_data_callable = partial(self.start_new_game, **kwargs)
+            game_data = await loop.run_in_executor(
+                self.executor, game_data_callable
+            )
         except Exception as e:
-            logger.error(f"执行 start_new_game 失败: {e}", exc_info=True)
+            logger.error(f"在线程池中执行 start_new_game 失败: {e}", exc_info=True)
             game_data = None
 
         if not game_data:
@@ -944,7 +1026,7 @@ class GuessSongPlugin(Star):  # type: ignore
                 self.context.active_game_sessions.remove(session_id)
             return
         
-        if not self.songs_data:
+        if not self.available_songs:
             await event.send(event.plain_result("......歌曲数据未加载，无法生成选项。"))
             if session_id in self.context.active_game_sessions:
                 self.context.active_game_sessions.remove(session_id)
@@ -952,14 +1034,14 @@ class GuessSongPlugin(Star):  # type: ignore
 
         # 准备选项
         correct_song = game_data['song']
-        other_songs = random.sample([s for s in self.songs_data if s['id'] != correct_song['id']], 11)
+        # --- 适配：使用 self.available_songs 而不是 self.songs_data ---
+        other_songs = random.sample([s for s in self.available_songs if s['id'] != correct_song['id']], 11)
         options = [correct_song] + other_songs
         random.shuffle(options)
         
         # 更新游戏数据
         game_data['options'] = options
         game_data['correct_answer_num'] = options.index(correct_song) + 1
-        game_data['game_mode'] = 'song'
         
         logger.info(f"[猜歌插件] 新游戏开始. 答案: {correct_song['title']} (选项 {game_data['correct_answer_num']})")
         
@@ -972,7 +1054,7 @@ class GuessSongPlugin(Star):  # type: ignore
         if options_img_path:
             intro_messages.append(Comp.Image(file=options_img_path))
             
-            jacket_path = self._get_resource_path_or_url(f"music_jacket/{correct_song['jacketAssetbundleName']}.png")
+        jacket_path = self._get_resource_path_or_url(f"music_jacket/{correct_song['jacketAssetbundleName']}.png")
         answer_reveal_messages = [
                 Comp.Plain(f"正确答案是: {game_data['correct_answer_num']}. {correct_song['title']}\n"),
                 Comp.Image(file=str(jacket_path))
@@ -985,198 +1067,190 @@ class GuessSongPlugin(Star):  # type: ignore
         "猜歌",
         alias={
             "gs",
-            # 添加所有带数字的指令作为别名，以确保它们能被路由到这个统一的处理器
             "猜歌1", "猜歌2", "猜歌3", "猜歌4", "猜歌5", "猜歌6", "猜歌7",
             "gs1", "gs2", "gs3", "gs4", "gs5", "gs6", "gs7"
         }
     )
     async def start_guess_song_unified(self, event: AstrMessageEvent):
         """统一处理所有固定模式的猜歌指令"""
-        # 提取模式编号
-        match = re.search(r'\d+', event.message_str)
-        mode_num_str = match.group(0) if match else None
-
-        # --- 新增：轻量模式检查 ---
-        is_lightweight = self.config.get("lightweight_mode", False)
-        if is_lightweight and mode_num_str in ['1', '2']: # 1=2倍速, 2=倒放
-            await event.send(event.plain_result("......轻量模式已启用，此模式不可用。"))
-            return
-        # --- 结束 ---
-
-        # 从映射中获取游戏参数
-        game_kwargs = self.game_modes.get(mode_num_str, {'kwargs': {'score': 1}})['kwargs']
-        
-        await self._start_game_logic(event, **game_kwargs)
-
-    @filter.command("随机猜歌", alias={"rgs"})
-    async def start_random_guess_song(self, event: AstrMessageEvent):
-        """开始一轮随机特殊模式的猜歌，可能叠加多种效果"""
         session_id = event.unified_msg_origin
         lock = self.context.game_session_locks.setdefault(session_id, asyncio.Lock())
-
+        
         async with lock:
             can_start, message = await self._check_game_start_conditions(event)
             if not can_start:
                 if message:
                     await event.send(event.plain_result(message))
                 return
-            # 在锁内标记会话
             self.context.active_game_sessions.add(session_id)
-            
-        debug_mode = self.config.get("debug_mode", False)
 
-        # --- 新增：为随机模式发送统计信标 ---
-        asyncio.create_task(self._send_stats_ping("guess_song_random"))
-        if not debug_mode:
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(
-                self.executor, self._record_game_start, event.get_sender_id(), event.get_sender_name()
-            )
+        initiator_id = event.get_sender_id()
+        initiator_name = event.get_sender_name()
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            self.executor, self._consume_daily_play_attempt_sync, initiator_id, initiator_name
+        )
+
+        match = re.search(r'(\d+)', event.message_str)
+        mode_key = match.group(1) if match else '1'
         
-        # --- 新逻辑：根据分数加权随机选择效果组合 ---
-        # --- 新增：轻量模式处理 ---
-        is_lightweight = self.config.get("lightweight_mode", False)
-        
-        # 基础效果（改变音频特性）
-        base_effects = [
-            {'name': '2倍速', 'kwargs': {'speed_multiplier': 2.0}, 'score': 1, 'group': 'speed'},
-            {'name': '倒放', 'kwargs': {'reverse_audio': True}, 'score': 3, 'group': 'direction'},
-        ]
-
-        if is_lightweight:
-            base_effects = []
-        # --- 结束 ---
-
-        # 音源效果（选择播放内容，互相排斥）
-        source_effects = [
-            # {'name': '带通滤波', 'kwargs': {'band_pass': (1, 200)}, 'score': 1, 'group': 'source'},
-            {'name': 'Twin Piano ver.', 'kwargs': {'melody_to_piano': True}, 'score': 2, 'group': 'source'},
-            {'name': '纯伴奏', 'kwargs': {'play_preprocessed': 'accompaniment'}, 'score': 1, 'group': 'source'},
-            {'name': '纯贝斯', 'kwargs': {'play_preprocessed': 'bass_only'}, 'score': 3, 'group': 'source'},
-            {'name': '纯鼓组', 'kwargs': {'play_preprocessed': 'drums_only'}, 'score': 4, 'group': 'source'},
-            {'name': '纯人声', 'kwargs': {'play_preprocessed': 'vocals_only'}, 'score': 1, 'group': 'source'},
-        ]
-
-        all_combinations = []
-        weights = []
-
-        # 生成所有可能的组合 (最多1个音源效果 + 最多2个基础效果)
-        for i in range(1, len(base_effects) + 2): # i 是组合中的效果总数
-            # 组合一：只包含一个音源效果
-            if i == 1:
-                for effect in source_effects:
-                    all_combinations.append([effect])
-            
-            # 组合二：一个音源效果 + 1到多个基础效果
-            for source_effect in source_effects:
-                # 从基础效果中选出 i-1 个
-                if i > 1 and i - 1 <= len(base_effects):
-                    for base_combo in itertools.combinations(base_effects, i - 1):
-                        all_combinations.append([source_effect] + list(base_combo))
-
-        # --- 重新计算权重和最终参数 ---
-        final_combinations = []
-        for combo in all_combinations:
-            current_kwargs = {}
-            current_score = 0
-            current_names = []
-            has_reverse = False
-            has_speed_up = False
-            speed_multiplier_value = 1.0
-
-            is_speedup_chosen = any('2倍速' in e['name'] for e in combo)
-            is_multi_effect_speedup = is_speedup_chosen and len(combo) > 1
-
-            temp_combo = list(combo)
-            if is_multi_effect_speedup:
-                for idx, effect in enumerate(temp_combo):
-                    if '2倍速' in effect['name']:
-                        modified_effect = effect.copy()
-                        modified_effect['kwargs'] = effect['kwargs'].copy()
-                        modified_effect['kwargs']['speed_multiplier'] = 1.5
-                        modified_effect['name'] = '1.5倍速'
-                        temp_combo[idx] = modified_effect
-                        break
-
-            for effect in temp_combo:
-                current_kwargs.update(effect['kwargs'])
-                current_score += effect['score']
-                current_names.append(effect['name'])
-                if 'reverse_audio' in effect['kwargs']:
-                    has_reverse = True
-                if 'speed_multiplier' in effect['kwargs']:
-                    has_speed_up = True
-                    speed_multiplier_value = effect['kwargs']['speed_multiplier']
-            
-            if has_reverse and has_speed_up:
-                current_score += 1
-
-            # 分数越高，权重越低 (已修改为1次幂，提供更平滑但仍有挑战的曲线)
-            weight = 1 / (current_score ** 1) if current_score > 0 else 1
-            final_combinations.append({
-                'kwargs': current_kwargs,
-                'score': current_score,
-                'names': current_names,
-                'has_reverse': has_reverse,
-                'has_speed_up': has_speed_up,
-                'speed_multiplier_value': speed_multiplier_value,
-                'weight': weight
-            })
-
-        # 根据权重随机选择一个组合
-        chosen_combination = random.choices(
-            population=final_combinations,
-            weights=[c['weight'] for c in final_combinations],
-            k=1
-        )[0]
-
-        # --- 从选中的组合中提取最终参数 ---
-        combined_kwargs = chosen_combination['kwargs']
-        total_score = chosen_combination['score']
-        effect_names_display = sorted(chosen_combination['names'])
-
-        # 修正组合效果的额外加分显示
-        if chosen_combination['has_reverse'] and chosen_combination['has_speed_up']:
-             # 找到并移除 "倒放" 和 "X倍速"，替换为组合名
-            effect_names_display = [n for n in effect_names_display if n not in ['倒放', '2倍速', '1.5倍速']]
-            effect_names_display.append(f"倒放+{chosen_combination['speed_multiplier_value']}倍速组合(+1分)")
-
-        combined_kwargs['score'] = total_score
-        # 记录本轮随机题型组合名
-        combined_kwargs['random_mode_name'] = 'random_' + '+'.join(sorted(chosen_combination['names']))
-        
-        # 显示将要应用的效果
-        effects_text = "、".join(effect_names_display)
-        await event.send(event.plain_result(f"......随机模式启动！本轮应用效果：【{effects_text}】(总计{total_score}分)"))
-        
-        # 准备游戏数据
-        try:
-            game_data = await self.start_new_game(**combined_kwargs)
-        except Exception as e:
-            logger.error(f"执行 start_new_game 失败: {e}", exc_info=True)
-            game_data = None
-            
-        if not game_data:
-            await event.send(event.plain_result("......开始游戏失败，可能是缺少资源文件、配置错误或ffmpeg未安装，请联系管理员。"))
+        mode_config = self.game_modes.get(mode_key)
+        if not mode_config:
+            await event.send(event.plain_result(f"......未知的猜歌模式 '{mode_key}'。"))
             if session_id in self.context.active_game_sessions:
                 self.context.active_game_sessions.remove(session_id)
             return
             
-        # 继续游戏逻辑
-        if not self.songs_data:
+        game_kwargs = mode_config['kwargs']
+
+        self._record_game_start(event.get_sender_id(), event.get_sender_name())
+        asyncio.create_task(self._api_ping("guess_song"))
+        
+        try:
+            game_data = await self.start_new_game(**game_kwargs)
+        except Exception as e:
+            logger.error(f"在 start_new_game 中发生错误: {e}", exc_info=True)
+            game_data = None
+
+        if not game_data:
+            await event.send(event.plain_result("......开始游戏失败，可能是缺少资源文件或配置错误。"))
+            if session_id in self.context.active_game_sessions:
+                self.context.active_game_sessions.remove(session_id)
+            return
+
+        if not self.available_songs:
             await event.send(event.plain_result("......歌曲数据未加载，无法生成选项。"))
             if session_id in self.context.active_game_sessions:
                 self.context.active_game_sessions.remove(session_id)
             return
 
         correct_song = game_data['song']
-        other_songs = random.sample([s for s in self.songs_data if s['id'] != correct_song['id']], 11)
+        other_songs = random.sample([s for s in self.available_songs if s['id'] != correct_song['id']], 11)
         options = [correct_song] + other_songs
         random.shuffle(options)
         
         game_data['options'] = options
         game_data['correct_answer_num'] = options.index(correct_song) + 1
-        game_data['game_mode'] = 'song'
+        
+        logger.info(f"[猜歌插件] 新游戏开始. 答案: {correct_song['title']} (选项 {game_data['correct_answer_num']})")
+        
+        options_img_path = await self._create_options_image(options)
+        timeout_seconds = self.config.get("answer_timeout", 30)
+        intro_text = f".......嗯\n这首歌是？请在{timeout_seconds}秒内发送编号回答。\n"
+        
+        intro_messages = [Comp.Plain(intro_text)]
+        if options_img_path:
+            intro_messages.append(Comp.Image(file=options_img_path))
+        
+        jacket_source = self._get_resource_path_or_url(f"music_jacket/{correct_song['jacketAssetbundleName']}.png")
+        answer_reveal_messages = [
+            Comp.Plain(f"正确答案是: {game_data['correct_answer_num']}. {correct_song['title']}\n"),
+        ]
+        if jacket_source:
+            answer_reveal_messages.append(Comp.Image(file=str(jacket_source)))
+        
+        await self._run_game_session(event, game_data, intro_messages, answer_reveal_messages)
+
+    @filter.command("随机猜歌", alias={"rgs"})
+    async def start_random_guess_song(self, event: AstrMessageEvent):
+        """开始一轮随机特殊模式的猜歌，采用目标优先模型选择效果"""
+        session_id = event.unified_msg_origin
+        lock = self.context.game_session_locks.setdefault(session_id, asyncio.Lock())
+        
+        async with lock:
+            can_start, message = await self._check_game_start_conditions(event)
+            if not can_start:
+                if message:
+                    await event.send(event.plain_result(message))
+                return
+            self.context.active_game_sessions.add(session_id)
+
+        initiator_id = event.get_sender_id()
+        initiator_name = event.get_sender_name()
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            self.executor, self._consume_daily_play_attempt_sync, initiator_id, initiator_name
+        )
+        
+        self._record_game_start(event.get_sender_id(), event.get_sender_name())
+        asyncio.create_task(self._api_ping("guess_song_random"))
+
+
+        # --- 新的随机效果选择逻辑 (目标优先模型) ---
+
+        # 1. 预计算所有可行的效果组合，并按分数分组
+        all_combinations_by_score = self._precompute_random_combinations()
+
+        if not all_combinations_by_score:
+            await event.send(event.plain_result("......随机模式启动失败，没有可用的效果组合。请检查资源文件。"))
+            if session_id in self.context.active_game_sessions:
+                self.context.active_game_sessions.remove(session_id)
+            return
+
+        # 2. 生成目标分数概率分布
+        target_distribution = self._get_random_target_distribution(all_combinations_by_score)
+
+        # 3. 根据概率分布，随机选择一个目标分数
+        scores = list(target_distribution.keys())
+        probabilities = list(target_distribution.values())
+        target_score = random.choices(scores, weights=probabilities, k=1)[0]
+        
+        # 4. 从能达成该分数的所有组合中，随机选择一个（已预处理好的）
+        valid_combinations = all_combinations_by_score[target_score]
+        chosen_processed_combo = random.choice(valid_combinations)
+
+        # --- 从选中的组合中提取最终参数 ---
+        combined_kwargs = chosen_processed_combo['final_kwargs']
+        total_score = chosen_processed_combo['final_score']
+        combined_kwargs['score'] = total_score
+        
+        effect_names = [eff['name'] for eff in chosen_processed_combo['effects_list']]
+        
+        # 修正组合效果的额外加分显示
+        effect_names_display = sorted(list(set(effect_names)))
+        speed_mult = combined_kwargs.get('speed_multiplier')
+        has_reverse = 'reverse_audio' in combined_kwargs
+
+        if speed_mult and has_reverse:
+            # 移除单独的名字，换成组合名
+            effect_names_display = [n for n in effect_names_display if n not in ['倒放', '2倍速', '1.5倍速']]
+            effect_names_display.append(f"倒放+{speed_mult}倍速组合(+1分)")
+        
+        # 记录本轮随机题型组合名 (用于统计)
+        mode_name_str = '+'.join(sorted([name.replace(' ver.', '') for name in effect_names if name != 'Off']))
+        combined_kwargs['random_mode_name'] = f"random_{mode_name_str}"
+        
+        # 显示将要应用的效果
+        effects_text = "、".join(sorted(effect_names_display))
+        await event.send(event.plain_result(f"......随机模式启动！本轮应用效果：【{effects_text}】(总计{total_score}分)"))
+        
+        # --- 后续游戏逻辑 (与原版保持一致) ---
+        try:
+            game_data = await self.start_new_game(**combined_kwargs)
+        except Exception as e:
+            logger.error(f"在 start_new_game 中发生错误: {e}", exc_info=True)
+            game_data = None
+
+        if not game_data:
+            error_message = game_data.get("error") if isinstance(game_data, dict) else "开始游戏失败，可能是缺少资源文件或配置错误。"
+            await event.send(event.plain_result(f"......{error_message}"))
+            if session_id in self.context.active_game_sessions:
+                self.context.active_game_sessions.remove(session_id)
+            return
+
+        if not self.available_songs:
+            await event.send(event.plain_result("......歌曲数据未加载，无法生成选项。"))
+            if session_id in self.context.active_game_sessions:
+                self.context.active_game_sessions.remove(session_id)
+            return
+
+        correct_song = game_data['song']
+        other_songs = random.sample([s for s in self.available_songs if s['id'] != correct_song['id']], 11)
+        options = [correct_song] + other_songs
+        random.shuffle(options)
+        
+        game_data['options'] = options
+        game_data['correct_answer_num'] = options.index(correct_song) + 1
         
         logger.info(f"[猜歌插件] 新游戏开始. 答案: {correct_song['title']} (选项 {game_data['correct_answer_num']})")
         
@@ -1208,18 +1282,27 @@ class GuessSongPlugin(Star):  # type: ignore
         lock = self.context.game_session_locks.setdefault(session_id, asyncio.Lock())
         
         async with lock:
+            # 1. 先检查条件
             can_start, message = await self._check_game_start_conditions(event)
             if not can_start:
                 if message:
                     await event.send(event.plain_result(message))
                 return
-            # 在锁内标记会话
+            # 2. 检查通过后，立即在锁内标记会话状态
             self.context.active_game_sessions.add(session_id)
+
+        # 3. 确认游戏开始后，在锁外为发起者扣减次数 (这是移动后的新位置)
+        initiator_id = event.get_sender_id()
+        initiator_name = event.get_sender_name()
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            self.executor, self._consume_daily_play_attempt_sync, initiator_id, initiator_name
+        )
         
         debug_mode = self.config.get("debug_mode", False)
 
         # --- 新增：为猜歌手模式发送统计信标 ---
-        asyncio.create_task(self._send_stats_ping("guess_song_vocalist"))
+        asyncio.create_task(self._api_ping("guess_song_vocalist"))
         if not debug_mode:
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(
@@ -1261,10 +1344,11 @@ class GuessSongPlugin(Star):  # type: ignore
         game_data['num_options'] = len(another_vocals)
         game_data['correct_answer_num'] = another_vocals.index(correct_vocal_version) + 1
         game_data['game_mode'] = 'vocalist' # 标记为猜歌手模式
+        game_data['game_type'] = 'vocalist'
 
         def get_vocalist_name(vocal_info):
             char_ids = [c['characterId'] for c in vocal_info.get('characters', [])]
-            names = [self.character_map.get(str(cid), "未知角色") for cid in char_ids]
+            names = [self.character_data.get(str(cid), "未知角色") for cid in char_ids]
             return " & ".join(names)
 
         compact_options_text = ""
@@ -1313,40 +1397,43 @@ class GuessSongPlugin(Star):  # type: ignore
             "    (该功能有统一的每日次数限制)\n\n"
             "📊 数据统计\n"
             "  猜歌分数 - 查看自己的猜歌积分和排名\n"
+            "  群猜歌排行榜 - 查看本群猜歌排行榜\n"
+            "  本地猜歌排行榜 - 查看插件本地存储的猜歌排行榜\n"
+            "  猜歌排行榜 - 查看服务器猜歌总排行榜 (联网)\n"
+            "  同步分数 - (管理员)将本地总分同步至服务器\n"
             "  查看统计 - 查看各题型的正确率排行"
         )
         await event.send(event.plain_result(help_text))
 
-    @filter.command("猜歌排行榜", alias={"gssrank", "gstop"})
+    @filter.command("群猜歌排行榜", alias={"gssrank", "gstop"})
     async def show_ranking(self, event: AstrMessageEvent):
-        """显示猜歌排行榜"""
+        """显示当前群聊的猜歌排行榜"""
         if not self._is_group_allowed(event): return
-        
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(self.executor, self._cleanup_output_dir)
 
-        rows = await loop.run_in_executor(self.executor, self._get_ranking_data_sync)
+        session_id = event.unified_msg_origin
+        loop = asyncio.get_running_loop()
+        rows = await loop.run_in_executor(self.executor, self._get_ranking_data_sync, session_id)
 
         if not rows:
-            yield event.plain_result("......目前还没有人参与过猜歌游戏")
+            await event.send(event.plain_result("......本群目前还没有人参与过猜歌游戏"))
             return
 
-        img_path = await loop.run_in_executor(self.executor, self._draw_ranking_image_sync, rows)
-        
+        img_path = await loop.run_in_executor(
+            self.executor, self._draw_ranking_image_sync, rows, "本群猜歌排行榜"
+        )
         if img_path:
-            yield event.image_result(img_path)
+            await event.send(event.image_result(img_path))
         else:
-            yield event.plain_result("生成排行榜图片时出错。")
-            
-    def _get_ranking_data_sync(self):
-        """[Helper] 同步获取排行榜数据"""
-        with self.get_conn() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT user_id, user_name, score, attempts, correct_attempts FROM user_stats ORDER BY score DESC LIMIT 10")
-            return cursor.fetchall()
+            await event.send(event.plain_result("生成排行榜图片时出错。"))
 
-    def _draw_ranking_image_sync(self, rows) -> Optional[str]:
-        """[Helper] 同步绘制排行榜图片"""
+    def _get_ranking_data_sync(self, session_id: str):
+        """获取指定会话的排行榜数据 (前10名)，现在由核心数据源驱动。"""
+        full_ranking = self._get_full_group_ranking_sync(session_id)
+        # 为了兼容绘图函数，即使完整的排行榜不足10人，也返回所有数据
+        return full_ranking[:10]
+
+    def _draw_ranking_image_sync(self, rows, title_text="猜歌排行榜") -> Optional[str]:
+        """[Helper] 同步绘制排行榜图片，已适配服务器/本群两种模式"""
         try:
             # 移植猜卡插件的排行榜生成逻辑以获得更好看的样式
             width, height = 650, 950
@@ -1388,7 +1475,7 @@ class GuessSongPlugin(Star):  # type: ignore
                 medal_font = body_font
 
             with Pilmoji(img) as pilmoji:
-                title_text = "猜歌排行榜"
+                # title_text = "猜歌排行榜"
                 # 修正：将浮点数坐标转换为整数
                 center_x, title_y = int(width / 2), 80
                 pilmoji.text((center_x + 2, title_y + 2), title_text, font=title_font, fill=shadow_color, anchor="mm")
@@ -1405,7 +1492,13 @@ class GuessSongPlugin(Star):  # type: ignore
                 
                 for i, row in enumerate(rows):
                     user_id, user_name, score, attempts, correct_attempts = str(row[0]), row[1], str(row[2]), str(row[3]), row[4]
-                    accuracy = f"{(correct_attempts * 100 / int(attempts) if int(attempts) > 0 else 0):.1f}%"
+                    
+                    if attempts == -1:
+                        accuracy = "N/A"
+                        attempts_str = "N/A"
+                    else:
+                        attempts_str = str(attempts)
+                        accuracy = f"{(correct_attempts * 100 / int(attempts) if int(attempts) > 0 else 0):.1f}%"
                     
                     rank = i + 1
                     col_positions = [40, 120, 320, 450, 560]
@@ -1423,7 +1516,7 @@ class GuessSongPlugin(Star):  # type: ignore
                     pilmoji.text((col_positions[1], current_y + 32), f"ID: {user_id}", font=id_font, fill=header_color)
                     pilmoji.text((col_positions[2], current_y), score, font=body_font, fill=score_color)
                     pilmoji.text((col_positions[3], current_y), accuracy, font=body_font, fill=accuracy_color)
-                    pilmoji.text((col_positions[4], current_y), attempts, font=body_font, fill=font_color)
+                    pilmoji.text((col_positions[4], current_y), attempts_str, font=body_font, fill=font_color)
 
                     if i < len(rows) - 1:
                         draw = ImageDraw.Draw(img)
@@ -1442,175 +1535,470 @@ class GuessSongPlugin(Star):  # type: ignore
             logger.error(f"生成猜歌排行榜图片时出错: {e}", exc_info=True)
             return None
 
-    @filter.command("猜歌分数", alias={"gsscore", "我的猜歌分数"})
-    async def show_user_score(self, event: AstrMessageEvent):
-        """显示玩家自己的猜歌积分和统计数据"""
+    def _get_global_ranking_data_sync(self):
+        """获取全局排行榜数据。"""
+        with self.get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT user_id, user_name, SUM(score) as total_score, SUM(attempts) as total_attempts, SUM(correct_attempts) as total_correct
+                FROM user_stats
+                GROUP BY user_id, user_name
+                ORDER BY total_score DESC
+                LIMIT 10
+            """)
+            return cursor.fetchall()
+
+    @filter.command("本地猜歌排行榜", alias={"localrank"})
+    async def show_local_global_ranking(self, event: AstrMessageEvent):
+        """显示本地存储的全局猜歌排行榜"""
         if not self._is_group_allowed(event): return
-        user_id = event.get_sender_id()
-        user_name = event.get_sender_name()
         
         loop = asyncio.get_running_loop()
-        full_user_data = await loop.run_in_executor(self.executor, self._get_user_score_data_sync, user_id)
-            
-        if not full_user_data:
-            yield event.plain_result(f"......{user_name}，你还没有参与过猜歌游戏哦。")
+        rows = await loop.run_in_executor(self.executor, self._get_global_ranking_data_sync)
+
+        if not rows:
+            await event.send(event.plain_result("......目前还没有人参与过猜歌游戏"))
             return
             
-        score, attempts, correct_attempts, last_play_date, daily_plays, rank = full_user_data
-        accuracy = (correct_attempts * 100 / attempts) if attempts > 0 else 0
+        # Re-format rows for the drawing function
+        formatted_rows = [(row[0], row[1], row[2], row[3], row[4]) for row in rows]
+
+        img_path = await loop.run_in_executor(
+            self.executor, self._draw_ranking_image_sync, formatted_rows, "本地总排行榜"
+        )
+        if img_path:
+            await event.send(event.image_result(img_path))
+        else:
+            await event.send(event.plain_result("生成排行榜图片时出错。"))
+
+    @filter.command("猜歌排行榜", alias={"gslrank", "gslglobal"})
+    async def show_global_ranking(self, event: AstrMessageEvent):
+        """显示服务器猜歌排行榜（已最终修正数据格式问题）"""
+        if not self.api_key:
+            yield event.plain_result("......未配置API Key，无法获取服务器排行榜。")
+            return
         
-        daily_limit = self.config.get("daily_play_limit", 15)
-        remaining_plays = daily_limit - daily_plays if last_play_date == time.strftime("%Y-%m-%d") else daily_limit
+        if not self.stats_server_url:
+            yield event.plain_result("......服务器地址配置不正确。")
+            return
+
+        try:
+            session = await self._get_session()
+            if not session:
+                yield event.plain_result("......网络组件初始化失败。")
+                return
+
+            leaderboard_url = f"{self.stats_server_url}/api/leaderboard"
+            
+            async with session.get(leaderboard_url, headers=self._get_api_headers(), timeout=10) as response:
+                if response.status == 401:
+                    yield event.plain_result("......API密钥无效，无法获取服务器排行榜。请检查插件配置。")
+                    return
+                response.raise_for_status()
+                rows_json = await response.json()
+
+        except Exception as e:
+            logger.error(f"获取服务器排行榜失败: {e}", exc_info=True)
+            yield event.plain_result(f"......获取服务器排行榜失败，请检查服务器状态和网络连接。错误: {e}")
+            return
+
+        if not rows_json:
+            yield event.plain_result("......服务器排行榜上还没有任何数据。")
+            return
+
+        # 修正：将从服务器获取的原始数据，正确地适配到绘图函数所需的 (user_id, user_name, score, attempts, correct_attempts) 格式
+        formatted_rows = [
+            (
+                r.get('user_id'),
+                r.get('user_name'),
+                r.get('total_score', 0),
+                r.get('total_attempts', 0),
+                r.get('correct_attempts', 0)
+            )
+            for r in rows_json
+        ]
+
+        try:
+            loop = asyncio.get_running_loop()
+            img_path = await loop.run_in_executor(self.executor, self._draw_ranking_image_sync, formatted_rows, "服务器猜歌总排行榜")
+            if img_path:
+                yield event.image_result(img_path)
+            else:
+                yield event.plain_result("生成排行榜图片时出错。")
+        except Exception as e:
+            logger.error(f"绘制服务器排行榜图片时出错: {e}", exc_info=True)
+            yield event.plain_result("生成排行榜图片时出错。")
+
+
+    @filter.command("猜歌分数", alias={"gsscore", "我的猜歌分数"})
+    async def show_user_score(self, event: AstrMessageEvent):
+        """显示用户在本群、服务器和本地的总分数统计。"""
+        user_id = str(event.get_sender_id())
+        user_name = event.get_sender_name()
+        # 修正：与 /群猜歌排行榜 统一使用 event.unified_msg_origin 作为群聊的唯一标识
+        session_id = event.unified_msg_origin
         
-        stats_text = (
-            f"--- {user_name} 的猜歌数据 ---\n"
-            f"🏆 总分: {score} 分\n"
-            f"🎯 正确率: {accuracy:.1f}%\n"
-            f"🎮 游戏次数: {attempts} 次\n"
-            f"✅ 答对次数: {correct_attempts} 次\n"
-            f"🏅 当前排名: 第 {rank} 名\n"
-            f"📅 今日剩余游戏次数: {remaining_plays} 次"
+        # 使用 asyncio.gather 并发执行所有异步和同步（在线程池中）任务
+        server_stats_task = asyncio.create_task(self._api_get_user_global_stats(user_id))
+        
+        loop = asyncio.get_running_loop()
+        # 统一调用新的数据获取函数
+        group_stats_task = loop.run_in_executor(self.executor, self._get_user_stats_in_group_sync, user_id, session_id)
+        local_global_stats_task = loop.run_in_executor(self.executor, self._get_user_local_global_stats_sync, user_id)
+        
+        server_stats, group_stats, local_global_stats = await asyncio.gather(
+            server_stats_task, group_stats_task, local_global_stats_task
         )
         
-        yield event.plain_result(stats_text)
+        # 构建最终输出
+        result_parts = [f"📊 {user_name} 的猜歌报告"]
+        
+        # 1. 本群战绩
+        if group_stats:
+            group_score = group_stats.get('score', 0)
+            group_attempts = group_stats.get('attempts', -1)
+            group_correct = group_stats.get('correct_attempts', -1)
+            
+            rank_str = f"(排名: {group_stats['rank']})" if group_stats.get('rank') is not None else "(排名: N/A)"
+            
+            # 只有在新数据模型（attempts >= 0）下才显示正确率
+            if group_attempts >= 0:
+                accuracy_str = f"{(group_correct * 100 / group_attempts if group_attempts > 0 else 0):.1f}% ({group_correct}/{group_attempts})"
+            else:
+                accuracy_str = "N/A" # 旧数据无法计算正确率
+
+            result_parts.append(
+                f"⚜️ 本群战绩 {rank_str}\n"
+                f"   - 分数: {group_score}\n"
+                f"   - 正确率: {accuracy_str}"
+            )
+        else:
+            result_parts.append(
+                "⚜️ 本群战绩\n"
+                "   - 暂无记录"
+            )
+        # 2. 总计战绩（服务器同步）
+        if server_stats:
+            server_score = server_stats.get('total_score', 0)
+            server_rank = server_stats.get('rank', 'N/A')
+            server_attempts = server_stats.get('total_attempts', 0)
+            server_correct = server_stats.get('correct_attempts', 0)
+            accuracy = f"{(server_correct * 100 / server_attempts if server_attempts > 0 else 0):.1f}%"
+            
+            result_parts.append(
+                f"🌐 总计战绩 (服务器, 排名: {server_rank})\n"
+                f"   - 分数: {server_score}\n"
+                f"   - 正确率: {accuracy} ({server_correct}/{server_attempts})"
+            )
+        # 如果服务器数据不可用，则显示本地的全局数据作为备用
+        elif local_global_stats:
+            local_score = local_global_stats.get('score', 0)
+            local_rank = local_global_stats.get('rank', 'N/A')
+            local_attempts = local_global_stats.get('attempts', 0)
+            local_correct = local_global_stats.get('correct', 0)
+            accuracy = f"{(local_correct * 100 / local_attempts if local_attempts > 0 else 0):.1f}%"
+            
+            result_parts.append(
+                f"🌐 总计战绩 (仅本地, 排名: {local_rank})\n"
+                f"   - 分数: {local_score}\n"
+                f"   - 正确率: {accuracy} ({local_correct}/{local_attempts})"
+            )
+        else:
+             result_parts.append(
+                "🌐 总计战绩\n"
+                "   - 暂无记录"
+            )
+
+        # 3. 每日剩余次数
+        if local_global_stats:
+            today = datetime.now().strftime("%Y-%m-%d")
+            # 只有当最后游戏日期是今天时，才显示已玩次数
+            daily_plays = local_global_stats.get('daily_plays', 0)
+            last_play_date = local_global_stats.get('last_play_date', '')
+            games_today = daily_plays if last_play_date == today else 0
+            
+            play_limit = self.config.get("daily_play_limit", 15)
+            listen_limit = self.config.get("daily_listen_limit", 5)
+            
+            # 同样的方法获取听歌次数
+            can_listen, listen_today = self._get_user_daily_limits_sync(user_id)
+            
+            result_parts.append(
+                f"🕒 剩余次数\n"
+                f"   - 猜歌: {play_limit - games_today}/{play_limit}\n"
+                f"   - 听歌: {listen_limit - listen_today}/{listen_limit}"
+            )
+
+        await event.send(event.plain_result("\n\n".join(result_parts)))
+
+    def _get_user_daily_limits_sync(self, user_id: str) -> Tuple[bool, int]:
+        """[Helper] 同步获取用户每日听歌限制。返回 (是否可听, 오늘听歌次数)"""
+        listen_limit = self.config.get("daily_listen_limit", 5)
+        with self.get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT daily_listen_songs, last_listen_date FROM user_stats WHERE user_id = ?", (user_id,))
+            row = cursor.fetchone()
+            if row:
+                daily_listen, last_date = row
+                today = datetime.now().strftime("%Y-%m-%d")
+                if last_date != today:
+                    return True, 0
+                return daily_listen < listen_limit, daily_listen
+            return True, 0
     
     # --- Data and state management methods ---
     def _record_game_start(self, user_id: str, user_name: str):
-        with self.get_conn() as conn:
-            cursor, today = conn.cursor(), time.strftime("%Y-%m-%d")
-            cursor.execute("SELECT last_play_date, daily_plays FROM user_stats WHERE user_id = ?", (user_id,))
-            user_data = cursor.fetchone()
-            if user_data:
-                last_play_date, _ = user_data
-                if last_play_date == today:
-                    cursor.execute("UPDATE user_stats SET user_name = ?, daily_plays = daily_plays + 1 WHERE user_id = ?", (user_name, user_id))
-                else:
-                    cursor.execute("UPDATE user_stats SET user_name = ?, last_play_date = ?, daily_plays = 1, daily_listen_plays = 0 WHERE user_id = ?", (user_name, today, user_id))
-            else:
-                cursor.execute("INSERT INTO user_stats (user_id, user_name, last_play_date, daily_plays, daily_listen_plays) VALUES (?, ?, ?, 1, 0)", (user_id, user_name, today))
-            conn.commit()
+        # This method is now a placeholder. The logic is handled in _update_stats and _run_game_session.
+        # It's kept for potential future use or compatibility.
+        pass
 
-    def _record_listen_song(self, user_id: str, user_name: str):
-        """统一记录听歌（钢琴/伴奏）次数"""
-        with self.get_conn() as conn:
-            cursor, today = conn.cursor(), time.strftime("%Y-%m-%d")
-            cursor.execute("SELECT last_play_date, daily_listen_plays FROM user_stats WHERE user_id = ?", (user_id,))
-            user_data = cursor.fetchone()
-            if user_data:
-                last_play_date, _ = user_data
-                if last_play_date == today:
-                    cursor.execute("UPDATE user_stats SET user_name = ?, daily_listen_plays = daily_listen_plays + 1 WHERE user_id = ?", (user_name, user_id))
-                else:
-                    cursor.execute("UPDATE user_stats SET user_name = ?, last_play_date = ?, daily_plays = 0, daily_listen_plays = 1 WHERE user_id = ?", (user_name, today, user_id))
-            else:
-                cursor.execute("INSERT INTO user_stats (user_id, user_name, last_play_date, daily_plays, daily_listen_plays) VALUES (?, ?, ?, 0, 1)", (user_id, user_name, today))
-            conn.commit()
-
-    def _update_stats(self, user_id: str, user_name: str, score: int, correct: bool):
-        """（已重构）使用原子化操作安全地更新用户统计数据。"""
+    def _record_listen_song(self, user_id: str, user_name: str, session_id: str):
+        """
+        [已重构] 记录用户听歌次数，并同步处理每日状态重置，修复日期不一致的漏洞。
+        """
         with self.get_conn() as conn:
             cursor = conn.cursor()
-            # 尝试更新现有用户。SET 子句中的表达式是原子性的。
-            cursor.execute(
-                """
-                UPDATE user_stats
-                SET
-                    user_name = ?,
-                    score = score + ?,
-                    attempts = attempts + 1,
-                    correct_attempts = correct_attempts + ?
-                WHERE user_id = ?
-                """,
-                (user_name, score, 1 if correct else 0, user_id)
-            )
+            today = datetime.now().strftime("%Y-%m-%d")
 
-            # 如果没有行被更新，说明用户不存在，则插入新记录。
-            if cursor.rowcount == 0:
+            # 1. 获取完整的用户每日统计数据
+            cursor.execute("""
+                SELECT daily_listen_songs, last_listen_date, daily_games_played, last_played_date
+                FROM user_stats WHERE user_id = ?
+            """, (user_id,))
+            row = cursor.fetchone()
+
+            if row:
+                # 用户存在
+                daily_listen, last_listen, daily_games, last_played = row
+                
+                # 2. 检查是否是新的一天，如果是，则重置所有每日统计
+                if last_listen != today:
+                    daily_listen = 0
+                    # 关键修复：当听歌是当天第一项活动时，也重置游戏次数
+                    if last_played != today:
+                        daily_games = 0
+                
+                # 3. 更新听歌次数
+                daily_listen += 1
+
+                # 4. 将所有更新写回数据库，确保两个日期同步
+                cursor.execute("""
+                    UPDATE user_stats SET 
+                        daily_listen_songs = ?, 
+                        last_listen_date = ?, 
+                        daily_games_played = ?, 
+                        last_played_date = ?, 
+                        user_name = ?
+                    WHERE user_id = ?
+                """, (daily_listen, today, daily_games, today, user_name, user_id))
+            else:
+                # 新用户，直接插入，确保两个日期都是今天
+                cursor.execute("""
+                    INSERT INTO user_stats (user_id, user_name, daily_listen_songs, last_listen_date, last_played_date) 
+                    VALUES (?, ?, 1, ?, ?)
+                """, (user_id, user_name, today, today))
+            
+            conn.commit()
+
+    def _update_stats(self, session_id: str, user_id: str, user_name: str, score: int, correct: bool):
+        """
+        [核心] 同步更新用户统计数据。
+        - 确保用户存在于数据库中。
+        - 更新总分、总尝试次数、总正确次数、连胜纪录。
+        - 更新分群JSON分数。
+        - 更新每日游戏次数和最后游戏日期。
+        """
+        with self.get_conn() as conn:
+            cursor = conn.cursor()
+            today = datetime.now().strftime("%Y-%m-%d")
+
+            # 1. 检查用户是否存在，如果不存在则创建
+            cursor.execute("SELECT * FROM user_stats WHERE user_id = ?", (user_id,))
+            user_data = cursor.fetchone()
+
+            if user_data is None:
+                # 插入一个包含默认值的新用户记录
+                cursor.execute("""
+                    INSERT INTO user_stats (
+                        user_id, user_name, score, attempts, correct_attempts, 
+                        daily_games_played, last_played_date, daily_listen_songs, 
+                        last_listen_date, correct_streak, max_correct_streak, group_scores
+                    ) VALUES (?, ?, 0, 0, 0, 0, ?, 0, ?, 0, 0, '{}')
+                """, (user_id, user_name, today, today))
+                # 重新获取新创建的用户数据
+                cursor.execute("SELECT * FROM user_stats WHERE user_id = ?", (user_id,))
+                user_data = cursor.fetchone()
+
+            # 为了方便通过列名访问，将元组转换为字典
+            columns = [desc[0] for desc in cursor.description]
+            user_stats = dict(zip(columns, user_data))
+            
+      
+
+            # 3. 更新核心统计数据
+            user_stats['attempts'] += 1
+            if correct:
+                user_stats['correct_attempts'] += 1
+                user_stats['score'] += score
+                user_stats['correct_streak'] += 1
+                user_stats['max_correct_streak'] = max(user_stats['correct_streak'], user_stats['max_correct_streak'])
+            else:
+                user_stats['correct_streak'] = 0
+
+            # 4. 更新分群分数 (group_scores JSON) -> 已升级为记录详细统计
+            try:
+                group_scores_json = user_stats.get('group_scores', '{}')
+                group_scores = json.loads(group_scores_json or '{}')
+            except (json.JSONDecodeError, TypeError):
+                group_scores = {}
+
+            # 获取当前群组的统计数据
+            group_stat_raw = group_scores.get(session_id)
+
+            # [迁移逻辑] 处理从旧的纯分数格式到新的字典格式的转换
+            if isinstance(group_stat_raw, int):
+                # 这是旧格式，需要转换为新格式
+                # 我们无法追溯历史尝试次数，所以只能从现在开始计算
+                group_stat = {"score": group_stat_raw, "attempts": 0, "correct_attempts": 0}
+            elif isinstance(group_stat_raw, dict):
+                # 已经是新格式
+                group_stat = group_stat_raw
+            else:
+                # 不存在或格式错误，初始化
+                group_stat = {"score": 0, "attempts": 0, "correct_attempts": 0}
+            
+            # 更新群组统计
+            group_stat["score"] += score
+            group_stat["attempts"] += 1
+            if correct:
+                group_stat["correct_attempts"] += 1
+            
+            # 将更新后的群组统计写回
+            group_scores[session_id] = group_stat
+            updated_group_scores_json = json.dumps(group_scores)
+
+            # 5. 将所有更新写回数据库
+            cursor.execute("""
+                UPDATE user_stats SET
+                    user_name = ?,
+                    score = ?,
+                    attempts = ?,
+                    correct_attempts = ?,
+                    correct_streak = ?,
+                    max_correct_streak = ?,
+                    group_scores = ?
+                WHERE user_id = ?
+            """, (
+                user_name,
+                user_stats['score'],
+                user_stats['attempts'],
+                user_stats['correct_attempts'],
+                user_stats['correct_streak'],
+                user_stats['max_correct_streak'],
+                updated_group_scores_json,
+                user_id
+            ))
+            conn.commit()
+    def _consume_daily_play_attempt_sync(self, user_id: str, user_name: str):
+        """
+        [新] 为指定用户消费一次每日游戏次数。
+        此函数应在游戏确认开始后，只对发起者调用一次。
+        """
+        with self.get_conn() as conn:
+            cursor = conn.cursor()
+            today = datetime.now().strftime("%Y-%m-%d")
+            
+            # 检查用户记录是否存在
+            cursor.execute("SELECT daily_games_played, last_played_date FROM user_stats WHERE user_id = ?", (user_id,))
+            user_data = cursor.fetchone()
+
+            if user_data:
+                # 用户存在，更新次数
+                daily_games, last_played = user_data
+                if last_played != today:
+                    # 如果不是今天玩的，次数重置为1
+                    new_daily_games = 1
+                else:
+                    # 如果是今天玩的，次数加1
+                    new_daily_games = daily_games + 1
+                
+                cursor.execute(
+                    "UPDATE user_stats SET daily_games_played = ?, last_played_date = ?, user_name = ? WHERE user_id = ?",
+                    (new_daily_games, today, user_name, user_id)
+                )
+            else:
+                # 用户不存在，创建新记录
                 cursor.execute(
                     """
-                    INSERT INTO user_stats
-                        (user_id, user_name, score, attempts, correct_attempts, last_play_date, daily_plays, daily_listen_plays)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (user_id, user_name, score, 1, 1 if correct else 0, time.strftime("%Y-%m-%d"), 0, 0)
+                    INSERT INTO user_stats (user_id, user_name, daily_games_played, last_played_date)
+                    VALUES (?, ?, 1, ?)
+                    """, (user_id, user_name, today)
                 )
             conn.commit()
 
     def _can_play(self, user_id: str) -> bool:
+        """检查用户今天是否还能玩游戏。"""
         daily_limit = self.config.get("daily_play_limit", 15)
         with self.get_conn() as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT daily_plays, last_play_date FROM user_stats WHERE user_id = ?", (user_id,))
+            cursor.execute("SELECT daily_games_played, last_played_date FROM user_stats WHERE user_id = ?", (user_id,))
             user_data = cursor.fetchone()
             return not (user_data and user_data[1] == time.strftime("%Y-%m-%d") and user_data[0] >= daily_limit)
             
-    def _can_listen_song(self, user_id: str) -> bool:
-        """统一检查听歌（钢琴/伴奏）次数"""
-        daily_limit = self.config.get("daily_listen_limit", 5)
-        with self.get_conn() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT daily_listen_plays, last_play_date FROM user_stats WHERE user_id = ?", (user_id,))
-            user_data = cursor.fetchone()
-            return not (user_data and user_data[1] == time.strftime("%Y-%m-%d") and user_data[0] >= daily_limit)
 
     @filter.command("重置猜歌次数", alias={"resetgs"})
     async def reset_guess_limit(self, event: AstrMessageEvent):
         """重置用户猜歌次数（仅限管理员）"""
-        if str(event.get_sender_id()) not in self.config.get("super_users", []):
+        if not event.is_admin:
             return
             
         parts = event.message_str.strip().split()
-        target_id = parts[1] if len(parts) > 1 and parts[1].isdigit() else event.get_sender_id()
-
-        loop = asyncio.get_running_loop()
-        success = await loop.run_in_executor(self.executor, self._reset_guess_limit_sync, target_id)
-
-        if success:
-            yield event.plain_result(f"......用户 {target_id} 的猜歌次数已重置。")
+        if len(parts) > 1 and parts[1].isdigit():
+            target_id = parts[1]
+            success = await asyncio.to_thread(self._reset_guess_limit_sync, target_id)
+            if success:
+                await event.send(event.plain_result(f"......用户 {target_id} 的猜歌次数已重置。"))
+            else:
+                await event.send(event.plain_result(f"......未找到用户 {target_id} 的游戏记录。"))
         else:
-            yield event.plain_result(f"......未找到用户 {target_id} 的游戏记录。")
+            await event.send(event.plain_result("请提供要重置的用户ID。"))
 
     def _reset_guess_limit_sync(self, target_id: str) -> bool:
-        """[Helper] 同步重置用户猜歌次数"""
+        """同步重置指定用户的每日游戏次数。"""
         with self.get_conn() as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT 1 FROM user_stats WHERE user_id = ?", (str(target_id),))
-            if cursor.fetchone():
-                cursor.execute("UPDATE user_stats SET daily_plays = 0 WHERE user_id = ?", (str(target_id),))
-                conn.commit()
-                return True
-            return False
+            # This resets the daily count across all sessions for the user.
+            cursor.execute("UPDATE user_stats SET daily_games_played = 0 WHERE user_id = ?", (target_id,))
+            conn.commit()
+            return cursor.rowcount > 0
 
     @filter.command("重置听歌次数", alias={"resetls"})
     async def reset_listen_limit(self, event: AstrMessageEvent):
-        """重置用户每日听歌次数（钢琴和伴奏）"""
-        if str(event.get_sender_id()) not in self.config.get("super_users", []):
+        """重置用户每日听歌次数（仅限管理员）"""
+        if not event.is_admin:
             return
             
         parts = event.message_str.strip().split()
-        target_id = parts[1] if len(parts) > 1 and parts[1].isdigit() else event.get_sender_id()
-
-        loop = asyncio.get_running_loop()
-        success = await loop.run_in_executor(self.executor, self._reset_listen_limit_sync, target_id)
-
-        if success:
-            await event.send(event.plain_result(f"......用户 {target_id} 的听歌次数已重置。"))
+        if len(parts) > 1 and parts[1].isdigit():
+            target_id = parts[1]
+            success = await asyncio.to_thread(self._reset_listen_limit_sync, target_id)
+            if success:
+                await event.send(event.plain_result(f"......用户 {target_id} 的听歌次数已重置。"))
+            else:
+                await event.send(event.plain_result(f"......未找到用户 {target_id} 的游戏记录。"))
         else:
-            await event.send(event.plain_result(f"......未找到用户 {target_id} 的游戏记录。"))
+            await event.send(event.plain_result("请提供要重置的用户ID。"))
 
     def _reset_listen_limit_sync(self, target_id: str) -> bool:
-        """[Helper] 同步重置用户每日听歌次数"""
+        """同步重置指定用户的每日听歌次数。"""
         with self.get_conn() as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT 1 FROM user_stats WHERE user_id = ?", (str(target_id),))
-            if cursor.fetchone():
-                cursor.execute("UPDATE user_stats SET daily_listen_plays = 0 WHERE user_id = ?", (str(target_id),))
-                conn.commit()
-                return True
-            return False
+            cursor.execute("UPDATE user_stats SET daily_listen_songs = 0 WHERE user_id = ?", (target_id,))
+            conn.commit()
+            return cursor.rowcount > 0
 
     def _reset_mode_stats_sync(self):
-        """[Helper] 同步清空所有题型统计数据"""
+        """同步清空题型统计数据。"""
         with self.get_conn() as conn:
             cursor = conn.cursor()
             cursor.execute("DELETE FROM mode_stats")
@@ -1628,20 +2016,14 @@ class GuessSongPlugin(Star):  # type: ignore
         await event.send(event.plain_result("......所有题型统计数据已被清空。"))
 
     async def terminate(self):
-        # --- 新增：在插件终止时关闭线程池和后台任务 ---
-        logger.info("正在关闭猜歌插件的线程池和后台任务...")
-        if self._cleanup_task:
+        """在插件终止时关闭线程池和后台任务"""
+        logger.info("正在关闭猜歌插件的后台任务...")
+        if hasattr(self, '_cleanup_task') and self._cleanup_task:
             self._cleanup_task.cancel()
-        
-        # 等待线程池任务完成
-        self.executor.shutdown(wait=True)
-        logger.info("ThreadPoolExecutor已关闭。")
-
-        if self.http_session and not self.http_session.closed:
-            await self.http_session.close()
-            logger.info("aiohttp session已关闭。")
+        if hasattr(self, '_manifest_load_task') and self._manifest_load_task:
+            self._manifest_load_task.cancel()
+        self.executor.shutdown(wait=False)
         logger.info("猜歌插件已终止。")
-        pass
 
     def _update_mode_stats(self, mode: str, correct: bool):
         with self.get_conn() as conn:
@@ -1663,7 +2045,31 @@ class GuessSongPlugin(Star):  # type: ignore
         if not self._is_group_allowed(event): return
         
         loop = asyncio.get_running_loop()
-        rows = await loop.run_in_executor(self.executor, self._get_mode_stats_sync)
+        rows = None
+
+        if not self.api_key:
+            # --- 离线模式：从本地数据库获取 ---
+            rows = await loop.run_in_executor(self.executor, self._get_mode_stats_sync)
+        else:
+            # --- 在线模式：从服务器API获取 ---
+            try:
+                session = await self._get_session()
+                if not session:
+                    yield event.plain_result("......网络组件初始化失败。"); return
+                
+                stats_url = f"{self.stats_server_url}/api/mode_stats"
+                async with session.get(stats_url, headers=self._get_api_headers(), timeout=5) as response:
+                    if response.status == 401:
+                        yield event.plain_result("......API密钥无效，无法获取题型统计。"); return
+                    response.raise_for_status()
+                    rows_json = await response.json()
+                    # 将json字典列表转换为数据库游标返回的元组列表，以适配后续代码
+                    rows = [(r['mode'], r['total_attempts'], r['correct_attempts']) for r in rows_json]
+            except Exception as e:
+                logger.error(f"获取在线题型统计失败: {e}", exc_info=True)
+                yield event.plain_result("......获取在线题型统计失败，将尝试使用本地数据。")
+                # --- 在线模式失败，回退到本地 ---
+                rows = await loop.run_in_executor(self.executor, self._get_mode_stats_sync)
 
         if not rows:
             yield event.plain_result("暂无题型统计数据。"); return
@@ -1776,20 +2182,22 @@ class GuessSongPlugin(Star):  # type: ignore
             logger.error(f"生成题型统计图片时出错: {e}", exc_info=True)
             return None
 
-    def _mode_display_name(self, mode):
-        # 题型名美化
-        mode_map = {
-            "speed": "2倍速", "reverse": "倒放", "piano": "钢琴",
-            "karaoke": "纯伴奏", "bass": "纯贝斯", "drums": "纯鼓组",
-            "vocals": "纯人声", "normal": "普通"
-        }
-        # 匹配随机组合模式
-        if mode.startswith("random_"):
-            parts = mode.replace("random_", "").split('+')
-            # 查找并美化每个部分
-            display_parts = [mode_map.get(p, p) for p in parts]
-            return "随机-" + "+".join(display_parts)
-        return mode_map.get(mode, mode)
+    def _mode_display_name(self, mode_key: str) -> str:
+        """(重构) 题型名美化，支持稳定ID"""
+        default_map = {"normal": "普通"}
+        if mode_key in default_map:
+            return default_map[mode_key]
+
+        if mode_key.startswith("random_"):
+            # 解析稳定ID，例如 "random_bass+reverse"
+            ids = mode_key.replace("random_", "").split('+')
+            # 查找每个ID当前的显示名
+            names = [self.game_effects.get(i, {}).get('name', i) for i in ids]
+            return "随机-" + "+".join(names)
+        
+        # 兼容旧的简单模式名
+        # 注意：这里我们假设简单模式的 mode_key 和 效果的 stable ID 是一致的
+        return self.game_effects.get(mode_key, {}).get('name', mode_key)
 
     @filter.command("测试猜歌", alias={"test_song", "调试猜歌"})
     async def test_guess_song(self, event: AstrMessageEvent):
@@ -1797,34 +2205,29 @@ class GuessSongPlugin(Star):  # type: ignore
         if str(event.get_sender_id()) not in self.config.get("super_users", []):
             return
 
-        # 新用法: /测试猜歌 [模式1,模式2,...] <歌曲名或ID>
-        # 例如: /测试猜歌 5,2 Tell Your World
-        # 例如: /测试猜歌 bass,reverse 21
-        
         parts = event.message_str.strip().split(maxsplit=1)
         if len(parts) < 2:
-            await event.send(event.plain_result("用法: /测试猜歌 [模式,...] <歌曲名或ID>\n例如: /测试猜歌 5,2 Tell Your World"))
+            await event.send(event.plain_result("用法: /测试猜歌 [模式,...] <歌曲名或ID>\n例如: /测试猜歌 bass,reverse Tell Your World"))
             return
 
         args_str = parts[1]
-        
-        # --- 智能解析模式和歌曲 ---
         arg_parts = args_str.split()
+        
         potential_modes_str = arg_parts[0]
-        
         temp_modes = re.split(r'[,，]', potential_modes_str)
-        are_all_modes = True
-        parsed_mode_keys = []
-
-        for mode_str in temp_modes:
-            mode_key = self.mode_name_map.get(mode_str.lower(), mode_str)
-            if mode_key not in self.game_modes:
-                are_all_modes = False
-                break
-            parsed_mode_keys.append(mode_key)
         
-        if are_all_modes:
-            mode_keys_input = list(dict.fromkeys(parsed_mode_keys)) # 去重并保持顺序
+        parsed_mode_keys = []
+        is_first_arg_modes = True
+        for mode_str in temp_modes:
+            mode_key = self.mode_name_map.get(mode_str.lower())
+            if mode_key:
+                parsed_mode_keys.append(mode_key)
+            else:
+                is_first_arg_modes = False
+                break
+        
+        if is_first_arg_modes and parsed_mode_keys:
+            mode_keys_input = list(dict.fromkeys(parsed_mode_keys))
             song_query = " ".join(arg_parts[1:])
         else:
             mode_keys_input = []
@@ -1834,45 +2237,33 @@ class GuessSongPlugin(Star):  # type: ignore
             await event.send(event.plain_result("请输入要测试的歌曲名称或ID。"))
             return
 
-        # --- 构建游戏参数 ---
         final_kwargs = {}
         effect_names = []
         total_score = 0
 
         if not mode_keys_input:
-            final_kwargs = self.game_modes[None]['kwargs'].copy()
-            effect_names.append("普通")
-            total_score = final_kwargs.get('score', 1)
-        else:
-            for mode_key in mode_keys_input:
-                mode_data = self.game_modes.get(mode_key)
-                if mode_data:
-                    final_kwargs.update(mode_data['kwargs'])
-                    display_name_found = False
-                    for name, key in self.mode_name_map.items():
-                        if key == mode_key and not name.isdigit():
-                            effect_names.append(name.capitalize())
-                            display_name_found = True
-                            break
-                    if not display_name_found:
-                        effect_names.append(f"模式{mode_key}")
-                    total_score += mode_data['kwargs'].get('score', 0)
+            mode_keys_input.append('1') 
+
+        for mode_key in mode_keys_input:
+            if mode_key in self.game_modes:
+                mode_data = self.game_modes[mode_key]
+                final_kwargs.update(mode_data.get('kwargs', {}))
+                effect_names.append(mode_data['name'])
+                total_score += mode_data.get('score', 0)
+            elif mode_key in self.game_effects:
+                effect_data = self.game_effects[mode_key]
+                final_kwargs.update(effect_data.get('kwargs', {}))
+                effect_names.append(effect_data['name'])
+                total_score += effect_data.get('score', 0)
         
-        # --- 查找歌曲（已修正逻辑） ---
         target_song = None
         if song_query.isdigit():
-            # 如果是数字，只按ID搜索
-            target_song = next((s for s in self.songs_data if s['id'] == int(song_query)), None)
+            target_song = next((s for s in self.song_data if s['id'] == int(song_query)), None)
         else:
-            # 否则，按标题搜索
-            exact_match = next((s for s in self.songs_data if s['title'].lower() == song_query.lower()), None)
-            if exact_match:
-                target_song = exact_match
-            else:
-                found_songs = [s for s in self.songs_data if song_query.lower() in s['title'].lower()]
-                if found_songs:
-                    # 选择最接近的匹配（最短的标题）
-                    target_song = min(found_songs, key=lambda s: len(s['title']))
+            found_songs = [s for s in self.song_data if song_query.lower() in s['title'].lower()]
+            if found_songs:
+                exact_match = next((s for s in found_songs if s['title'].lower() == song_query.lower()), None)
+                target_song = exact_match or min(found_songs, key=lambda s: len(s['title']))
         
         if not target_song:
             await event.send(event.plain_result(f'未在数据库中找到与 "{song_query}" 匹配的歌曲。'))
@@ -1880,7 +2271,6 @@ class GuessSongPlugin(Star):  # type: ignore
 
         final_kwargs['force_song_object'] = target_song
 
-        # --- 在线程池中执行游戏准备 ---
         try:
             game_data = await self.start_new_game(**final_kwargs)
         except Exception as e:
@@ -1891,13 +2281,11 @@ class GuessSongPlugin(Star):  # type: ignore
             await event.send(event.plain_result("......生成测试游戏失败，请检查日志。"))
             return
 
-        # --- 发送测试结果 ---
         correct_song = game_data['song']
-        other_songs = random.sample([s for s in self.songs_data if s['id'] != correct_song['id']], 11)
+        other_songs = random.sample([s for s in self.song_data if s['id'] != correct_song['id']], 11)
         options = [correct_song] + other_songs
         random.shuffle(options)
         correct_answer_num = options.index(correct_song) + 1
-
         options_img_path = await self._create_options_image(options)
         
         effects_text = "、".join(sorted(list(set(effect_names)))) or "普通"
@@ -1913,9 +2301,7 @@ class GuessSongPlugin(Star):  # type: ignore
         await asyncio.sleep(0.5)
 
         jacket_source = self._get_resource_path_or_url(f"music_jacket/{correct_song['jacketAssetbundleName']}.png")
-        answer_msg = [
-            Comp.Plain(f"[测试模式] 正确答案是: {correct_answer_num}. {correct_song['title']}\n"),
-        ]
+        answer_msg = [Comp.Plain(f"[测试模式] 正确答案是: {correct_answer_num}. {correct_song['title']}\n")]
         if jacket_source:
             answer_msg.append(Comp.Image(file=str(jacket_source)))
         await event.send(event.chain_result(answer_msg))
@@ -2006,38 +2392,38 @@ class GuessSongPlugin(Star):  # type: ignore
             # 所有检查通过后，在锁内标记会话
             self.context.active_game_sessions.add(session_id)
 
-        # --- 新增：为听歌模式发送统计信标 ---
-        asyncio.create_task(self._send_stats_ping(f"listen_{mode}"))
-
-        # --- 3. 通用的参数解析和歌曲查找（已修正逻辑） ---
-        args = event.message_str.strip().split(maxsplit=1)
-        search_term = args[1] if len(args) > 1 else None
-        song_to_play = None
-
-        if search_term:
-            if search_term.isdigit():
-                # 如果是数字，只按ID搜索
-                music_id_to_find = int(search_term)
-                song_to_play = next((s for s in config['available_songs'] if s['id'] == music_id_to_find), None)
-            else:
-                # 否则，按标题搜索
-                found_songs = [s for s in config['available_songs'] if search_term.lower() in s['title'].lower()]
-                if found_songs:
-                    exact_match = next((s for s in found_songs if s['title'].lower() == search_term.lower()), None)
-                    if exact_match:
-                        song_to_play = exact_match
-                    else:
-                        # 选择最接近的匹配（最短的标题）
-                        song_to_play = min(found_songs, key=lambda s: len(s['title']))
-            
-            if not song_to_play:
-                yield event.plain_result(config['no_match_msg'].format(search_term=search_term))
-                return
-        else:
-            song_to_play = random.choice(config['available_songs'])
-            
-        # 4. 通用的会话处理和消息发送
         try:
+            # --- 新增：为听歌模式发送统计信标 ---
+            asyncio.create_task(self._api_ping(f"listen_{mode}"))
+
+            # --- 3. 通用的参数解析和歌曲查找（已修正逻辑） ---
+            args = event.message_str.strip().split(maxsplit=1)
+            search_term = args[1] if len(args) > 1 else None
+            song_to_play = None
+
+            if search_term:
+                if search_term.isdigit():
+                    # 如果是数字，只按ID搜索
+                    music_id_to_find = int(search_term)
+                    song_to_play = next((s for s in config['available_songs'] if s['id'] == music_id_to_find), None)
+                else:
+                    # 否则，按标题搜索
+                    found_songs = [s for s in config['available_songs'] if search_term.lower() in s['title'].lower()]
+                    if found_songs:
+                        exact_match = next((s for s in found_songs if s['title'].lower() == search_term.lower()), None)
+                        if exact_match:
+                            song_to_play = exact_match
+                        else:
+                            # 选择最接近的匹配（最短的标题）
+                            song_to_play = min(found_songs, key=lambda s: len(s['title']))
+                
+                if not song_to_play:
+                    yield event.plain_result(config['no_match_msg'].format(search_term=search_term))
+                    return
+            else:
+                song_to_play = random.choice(config['available_songs'])
+                
+            # 4. 通用的会话处理和消息发送
             song = song_to_play
             mp3_source: Optional[Union[Path, str]] = None
             
@@ -2078,8 +2464,21 @@ class GuessSongPlugin(Star):  # type: ignore
             yield event.chain_result(msg_chain)
             yield event.chain_result([Comp.Record(file=str(mp3_source))])
 
+            user_id = event.get_sender_id()
             loop = asyncio.get_running_loop()
-            await loop.run_in_executor(self.executor, self._record_listen_song, user_id, event.get_sender_name())
+            await loop.run_in_executor(self.executor, self._record_listen_song, user_id, event.get_sender_name(), session_id)
+            
+            # --- 新增：为听歌功能发送统计日志 ---
+            asyncio.create_task(self._api_log_game({
+                "game_type": 'listen',
+                "game_mode": mode,
+                "user_id": user_id,
+                "user_name": event.get_sender_name(),
+                "is_correct": False,
+                "score_awarded": 0, # 修正：字段名以匹配服务器
+                "session_id": session_id
+            }))
+
             self.last_game_end_time[session_id] = time.time()
 
         except Exception as e:
@@ -2120,53 +2519,424 @@ class GuessSongPlugin(Star):  # type: ignore
         async for result in self._handle_listen_command(event, mode="drums"):
             yield result
 
-    async def _send_stats_ping(self, game_type: str):
-        """(已重构) 向专用统计服务器的5000端口发送GET请求。"""
-        if self.config.get("use_local_resources", True):
+    def _get_all_user_stats_sync(self):
+        """获取所有用户的统计数据以用于迁移。"""
+        with self.get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT user_id, user_name, score FROM user_stats WHERE score > 0")
+            return cursor.fetchall()
+
+    def _get_all_mode_stats_sync(self):
+        """新增：获取所有题型统计数据以用于迁移。"""
+        with self.get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT mode, total_attempts, correct_attempts FROM mode_stats")
+            return cursor.fetchall()
+
+    @filter.command("同步分数", alias={"syncscore", "migrategs"})
+    async def sync_scores_to_server(self, event: AstrMessageEvent):
+        """(管理员) 将本地所有玩家分数数据一次性同步至服务器排行榜。"""
+        if str(event.get_sender_id()) not in self.config.get("super_users", []):
+            yield event.plain_result("......权限不足，只有管理员才能执行此操作。")
             return
 
-        resource_url_base = self.config.get("remote_resource_url_base", "")
-        if not resource_url_base:
+        if not self.api_key:
+            yield event.plain_result("......未配置服务器排行榜功能，无法同步。请先在配置文件中设置API密钥。")
             return
 
+        if not self.stats_server_url:
+            yield event.plain_result("......服务器地址配置不正确，无法同步。")
+            return
+        
+        yield event.plain_result("......正在准备同步所有本地玩家分数至服务器排行榜...")
+
+        loop = asyncio.get_running_loop()
+        all_local_users = await loop.run_in_executor(self.executor, self._get_all_user_stats_sync)
+        
+        if not all_local_users:
+            yield event.plain_result("......本地没有任何玩家数据，无需同步。")
+            return
+
+        payload = [
+            {"user_id": str(user[0]), "user_name": user[1], "score": user[2]}
+            for user in all_local_users
+        ]
+
+        migrate_url = f"{self.stats_server_url}/api/migrate_leaderboard"
         try:
             session = await self._get_session()
             if not session:
-                logger.warning("aiohttp not installed, cannot send stats ping.")
+                yield event.plain_result("......网络组件初始化失败。")
                 return
-
-            # 从资源URL中提取协议和主机名，然后强制使用5000端口
-            parsed_url = urlparse(resource_url_base)
-            stats_server_root = f"{parsed_url.scheme}://{parsed_url.hostname}:5000"
             
-            # 构建最终的统计请求URL
-            ping_url = f"{stats_server_root}/stats_ping/{game_type}.ping"
+            yield event.plain_result(f"......正在将 {len(payload)} 条玩家数据同步至服务器...")
+            async with session.post(migrate_url, json=payload, headers=self._get_api_headers(), timeout=60) as response:
+                if response.status == 200:
+                    result = await response.json()
+                    yield event.plain_result(f"✅ 分数同步成功！\n处理了 {result.get('processed_count', 0)} 条记录。\n新增了 {result.get('new_records', 0)} 条记录。\n更新了 {result.get('updated_records', 0)} 条记录。")
+                elif response.status == 401:
+                    yield event.plain_result(f"❌ 分数同步失败：API密钥无效。")
+                else:
+                    yield event.plain_result(f"❌ 分数同步失败，服务器返回错误：{response.status} {await response.text()}")
 
-            # 异步发送请求
-            async with session.get(ping_url, timeout=2):
-                pass  # We just need the request to be made.
         except Exception as e:
-            logger.warning(f"Stats ping to {ping_url} failed: {e}")
+            logger.error(f"同步服务器分数失败: {e}", exc_info=True)
+            yield event.plain_result(f"❌ 同步失败，发生网络错误或服务器无响应。")
 
     def _can_listen_song_sync(self, user_id: str) -> bool:
         """[Helper] 同步检查听歌次数"""
         daily_limit = self.config.get("daily_listen_limit", 5)
         with self.get_conn() as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT daily_listen_plays, last_play_date FROM user_stats WHERE user_id = ?", (user_id,))
+            cursor.execute("SELECT daily_listen_songs, last_listen_date FROM user_stats WHERE user_id = ?", (user_id,))
             user_data = cursor.fetchone()
             return not (user_data and user_data[1] == time.strftime("%Y-%m-%d") and user_data[0] >= daily_limit)
 
-    def _get_user_score_data_sync(self, user_id: str) -> Optional[tuple]:
-        """[Helper] 同步获取用户分数数据"""
+
+    def _get_user_local_global_stats_sync(self, user_id: str) -> Optional[Dict]:
+        """[Helper] 同步获取用户的本地全局统计数据（用于备用和每日次数）。"""
         with self.get_conn() as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT score, attempts, correct_attempts, last_play_date, daily_plays FROM user_stats WHERE user_id = ?", (user_id,))
-            user_data = cursor.fetchone()
-            if not user_data:
-                return None
+            cursor.execute("""
+                SELECT score, attempts, correct_attempts, daily_games_played, last_played_date FROM user_stats
+                WHERE user_id = ?
+            """, (user_id,))
+            global_row = cursor.fetchone()
             
-            score = user_data[0]
-            cursor.execute("SELECT COUNT(*) FROM user_stats WHERE score > ?", (score,))
-            rank = cursor.fetchone()[0] + 1
-            return user_data + (rank,)
+            if not global_row:
+                return None
+
+            global_score = global_row[0]
+            cursor.execute("SELECT COUNT(*) + 1 FROM user_stats WHERE score > ?", (global_score,))
+            global_rank = cursor.fetchone()[0]
+
+            return {
+                'score': global_row[0],
+                'attempts': global_row[1],
+                'correct': global_row[2],
+                'daily_plays': global_row[3],
+                'last_play_date': global_row[4],
+                'rank': global_rank
+            }
+
+
+    # --- 新增：API 通信模块 ---
+    def _get_stats_server_root(self) -> Optional[str]:
+        """根据配置获取统计服务器的根URL。"""
+        url_base = self.config.get("remote_resource_url_base", "")
+        if not url_base:
+            logger.warning("API密钥已配置, 但 'remote_resource_url_base' 未设置, 无法确定统计服务器地址。")
+            return None
+        parsed_url = urlparse(url_base)
+        return f"{parsed_url.scheme}://{parsed_url.hostname}:5000"
+
+    def _get_api_headers(self) -> Dict[str, str]:
+        """获取带有认证信息的API请求头。"""
+        return {"X-API-KEY": self.api_key} if self.api_key else {}
+
+    async def _api_ping(self, event_type: str):
+        """向服务器发送一个简单的事件埋点。"""
+        if not self.stats_server_url: return
+        
+        ping_url = f"{self.stats_server_url}/api/ping/{event_type}" # 修正：添加 /api 前缀
+        try:
+            session = await self._get_session()
+            if not session: return
+            async with session.get(ping_url, headers=self._get_api_headers(), timeout=2):
+                pass
+        except Exception as e:
+            logger.warning(f"Stats ping to {ping_url} failed: {e}")
+
+    async def _api_log_game(self, game_log_data: dict):
+        """向服务器记录一条详细的游戏日志。"""
+        if not self.stats_server_url: return
+
+        post_url = f"{self.stats_server_url}/api/log_game" # 修正：添加 /api 前缀
+        try:
+            session = await self._get_session()
+            if not session: return
+            async with session.post(post_url, json=game_log_data, headers=self._get_api_headers(), timeout=3) as resp:
+                if resp.status != 200:
+                    logger.warning(f"记录游戏日志失败. Status: {resp.status}, Response: {await resp.text()}")
+        except Exception as e:
+            logger.warning(f"发送游戏日志至 {post_url} 失败: {e}")
+
+    async def _api_update_score(self, user_id: str, user_name: str, score_delta: int):
+        """向服务器同步玩家的分数变化。"""
+        if not self.stats_server_url or score_delta == 0:
+            return
+
+        payload = {
+            "user_id": str(user_id),
+            "user_name": user_name,
+            "score_change": score_delta # 修正：字段名以匹配服务器
+        }
+        post_url = f"{self.stats_server_url}/api/update_score" # 修正：添加 /api 前缀
+        try:
+            session = await self._get_session()
+            if not session: return
+            async with session.post(post_url, json=payload, headers=self._get_api_headers(), timeout=3) as resp:
+                 if resp.status != 200:
+                    logger.warning(f"同步分数至服务器失败. Status: {resp.status}, Response: {await resp.text()}")
+        except Exception as e:
+            logger.warning(f"发送分数更新至 {post_url} 失败: {e}")
+
+    async def _send_stats_ping(self, game_type: str):
+        """向专用统计服务器的5000端口发送GET请求。"""
+        # --- 核心恢复：使用旧的、能工作的统计逻辑 ---
+        stats_url = self.config.get("remote_statistics_url")
+        if not stats_url:
+            return
+
+        try:
+            parsed_url = urlparse(stats_url)
+            stats_server_root = f"{parsed_url.scheme}://{parsed_url.hostname}:5000"
+            ping_url = f"{stats_server_root}/stats_ping/{game_type}.ping"
+
+            loop = asyncio.get_running_loop()
+            loop.run_in_executor(self.executor, self._execute_ping_request, ping_url)
+        except Exception as e:
+            logger.error(f"无法调度统计ping任务: {e}")
+
+    def _execute_ping_request(self, ping_url: str):
+        """[Helper] Synchronous function to execute the ping request. Meant for ThreadPoolExecutor."""
+        try:
+            # urlopen is a blocking call, perfect for the executor.
+            with urlopen(ping_url, timeout=2):
+                pass  # We just need the request to be made.
+        except Exception as e:
+            # It's better to log this for debugging, even if we don't let it crash.
+            logger.warning(f"Stats ping to {ping_url} failed: {e}")
+
+    async def _api_get_user_global_stats(self, user_id: str) -> Optional[Dict]:
+        """通过API获取用户的服务器统计数据。"""
+        if not self.stats_server_url:
+            return None
+
+        stats_url = f"{self.stats_server_url}/api/user_stats/{user_id}"
+        try:
+            session = await self._get_session()
+            if not session:
+                logger.warning("aiohttp session 不可用，无法获取服务器用户数据。")
+                return None
+            async with session.get(stats_url, headers=self._get_api_headers(), timeout=5) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    logger.info(f"成功从API获取用户 {user_id} 的服务器数据: {data}")
+                    return data
+                elif response.status == 404:
+                    logger.info(f"用户 {user_id} 在服务器排行榜上尚无数据。")
+                    return None 
+                else:
+                    logger.warning(f"获取用户 {user_id} 服务器数据失败. Status: {response.status}, Response: {await response.text()}")
+                    return None
+        except Exception as e:
+            logger.error(f"请求 {stats_url} 失败: {e}", exc_info=True)
+            return None
+
+    def _get_full_group_ranking_sync(self, session_id: str) -> List[Tuple]:
+        """
+        [核心数据源] 获取指定群组的完整、已排序的玩家列表。
+        返回一个元组列表: (user_id, user_name, score, attempts, correct_attempts)，只包含分数大于0的玩家。
+        """
+        with self.get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT user_id, user_name, group_scores 
+                FROM user_stats
+            """)
+            all_users_data = cursor.fetchall()
+
+            group_ranking = []
+            for user_id, user_name, group_scores_json in all_users_data:
+                if not group_scores_json:
+                    continue
+                
+                try:
+                    group_scores = json.loads(group_scores_json)
+                    group_stat_raw = group_scores.get(session_id)
+                    
+                    if not group_stat_raw:
+                        continue
+                    
+                    # [兼容处理] 兼容旧的纯分数格式和新的字典格式
+                    if isinstance(group_stat_raw, int):
+                        score = group_stat_raw
+                        attempts, correct_attempts = -1, -1 # 旧数据标记为不可用
+                    elif isinstance(group_stat_raw, dict):
+                        score = group_stat_raw.get("score", 0)
+                        attempts = group_stat_raw.get("attempts", 0)
+                        correct_attempts = group_stat_raw.get("correct_attempts", 0)
+                    else:
+                        continue # 跳过无法识别的格式
+
+                    if score > 0:
+                        group_ranking.append((user_id, user_name, score, attempts, correct_attempts))
+
+                except (json.JSONDecodeError, TypeError):
+                    continue
+        
+        group_ranking.sort(key=lambda x: x[2], reverse=True)
+        return group_ranking
+
+    def _get_user_stats_in_group_sync(self, user_id_to_find: str, session_id: str) -> Optional[Dict]:
+        """
+        [新] 使用统一数据源获取单个用户在群组中的分数、排名和详细统计。
+        """
+        full_ranking = self._get_full_group_ranking_sync(session_id)
+        
+        # 在排行榜（分数>0）中查找用户
+        for i, (user_id, _, score, attempts, correct_attempts) in enumerate(full_ranking):
+            if user_id == user_id_to_find:
+                return {
+                    "score": score, 
+                    "rank": i + 1,
+                    "attempts": attempts,
+                    "correct_attempts": correct_attempts
+                }
+        
+        # 如果用户不在排行榜上（分数为0或无记录），则手动查找
+        with self.get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT group_scores FROM user_stats WHERE user_id = ?", (user_id_to_find,))
+            row = cursor.fetchone()
+            if row and row[0]:
+                try:
+                    group_scores = json.loads(row[0])
+                    group_stat = group_scores.get(session_id)
+                    if isinstance(group_stat, dict):
+                        return {
+                            "score": group_stat.get("score", 0), 
+                            "rank": None,
+                            "attempts": group_stat.get("attempts", 0),
+                            "correct_attempts": group_stat.get("correct_attempts", 0)
+                        }
+                    elif isinstance(group_stat, int): # 兼容旧数据
+                        return {"score": group_stat, "rank": None, "attempts": -1, "correct_attempts": -1}
+
+                except (json.JSONDecodeError, TypeError):
+                    pass
+        
+        # 对于全新用户或无任何记录的用户
+        return {"score": 0, "rank": None, "attempts": 0, "correct_attempts": 0}
+
+    def _get_user_local_global_stats_sync(self, user_id: str) -> Optional[Dict]:
+        """[Helper] 同步获取用户的本地全局统计数据（用于备用和每日次数）。"""
+        with self.get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT score, attempts, correct_attempts, daily_games_played, last_played_date FROM user_stats
+                WHERE user_id = ?
+            """, (user_id,))
+            global_row = cursor.fetchone()
+            
+            if not global_row:
+                return None
+
+            global_score = global_row[0]
+            cursor.execute("SELECT COUNT(*) + 1 FROM user_stats WHERE score > ?", (global_score,))
+            global_rank = cursor.fetchone()[0]
+
+            return {
+                'score': global_row[0],
+                'attempts': global_row[1],
+                'correct': global_row[2],
+                'daily_plays': global_row[3],
+                'last_play_date': global_row[4],
+                'rank': global_rank
+            }
+
+    def _precompute_random_combinations(self) -> Dict[int, List[Dict]]:
+        """
+        [新] 预计算所有可行的随机效果组合。
+        该方法会检查资源可用性，并处理好多效果组合的特殊规则（如1.5倍速）。
+        返回一个按最终分数分组的字典。
+        """
+        combinations_by_score = defaultdict(list)
+
+        # 1. 筛选出当前可玩的“音源类”效果
+        playable_source_effects = []
+        for effect in self.source_effects:
+            kwargs = effect.get('kwargs', {})
+            if 'play_preprocessed' in kwargs:
+                mode = kwargs['play_preprocessed']
+                if self.preprocessed_tracks.get(mode):
+                    playable_source_effects.append(effect)
+            elif 'melody_to_piano' in kwargs:
+                if self.available_piano_songs:
+                    playable_source_effects.append(effect)
+            else:  # 假设普通模式总是可用
+                playable_source_effects.append(effect)
+
+        # 2. 构建“独立类”效果的选项（开启/关闭）
+        independent_options = []
+        for effect in self.base_effects:
+            # (开启效果, 关闭效果)
+            independent_options.append([effect, {'name': 'Off', 'score': 0, 'kwargs': {}}])
+
+        if not playable_source_effects:
+            return {}
+
+        # 3. 使用 itertools.product 枚举所有组合
+        for source_effect in playable_source_effects:
+            for independent_choices in itertools.product(*independent_options):
+                
+                raw_combination = [source_effect] + [choice for choice in independent_choices if choice['score'] > 0]
+                
+                final_effects_list = []
+                final_kwargs = {}
+                base_score = 0
+                
+                # 特殊处理：当效果多于1个时，2倍速降为1.5倍速
+                is_multi_effect = len(raw_combination) > 1
+                
+                for effect_template in raw_combination:
+                    # 深拷贝以避免修改类属性中的原始定义
+                    effect = {k: (v.copy() if isinstance(v, dict) else v) for k, v in effect_template.items()}
+                    
+                    if is_multi_effect and 'speed_multiplier' in effect.get('kwargs', {}):
+                        effect['kwargs']['speed_multiplier'] = 1.5
+                        effect['name'] = '1.5倍速'
+                    
+                    final_effects_list.append(effect)
+                    final_kwargs.update(effect.get('kwargs', {}))
+                    base_score += effect.get('score', 0)
+
+                # 4. 计算最终分数（包含组合加分）
+                final_score = base_score
+                if 'speed_multiplier' in final_kwargs and 'reverse_audio' in final_kwargs:
+                    final_score += 1
+
+                # 5. 将处理好的完整信息存入字典
+                processed_combo = {
+                    'effects_list': final_effects_list,
+                    'final_kwargs': final_kwargs,
+                    'final_score': final_score,
+                }
+                combinations_by_score[final_score].append(processed_combo)
+                
+        return dict(combinations_by_score)
+
+    def _get_random_target_distribution(self, combinations_by_score: Dict[int, list]) -> Dict[int, float]:
+        """
+        [新] 根据预计算的组合和衰减因子，生成目标分数概率分布。
+        """
+        if not combinations_by_score:
+            return {}
+
+        scores = sorted(combinations_by_score.keys())
+        decay_factor = self.random_mode_decay_factor
+        
+        # 使用几何衰减模型计算每个分数的权重
+        weights = [decay_factor ** score for score in scores]
+        
+        # 归一化权重以得到概率
+        total_weight = sum(weights)
+        if total_weight == 0: # 避免除以零
+            # 如果权重和为0，回退到均匀分布
+            return {score: 1.0 / len(scores) for score in scores}
+            
+        probabilities = [w / total_weight for w in weights]
+        
+        return dict(zip(scores, probabilities))
+
