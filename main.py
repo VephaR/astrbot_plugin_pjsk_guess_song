@@ -2229,7 +2229,7 @@ class GuessSongPlugin(Star):  # type: ignore
         applied_effects = "、".join(effect_names)
         intro_text = f"--- 调试模式 ---\n歌曲: {correct_song['title']}\n效果: {applied_effects}\n答案: {correct_answer_num}"
         
-        messages = [Comp.Plain(intro_text)]
+        msg_chain = [Comp.Plain(intro_text)]
         if options_img_path:
             msg_chain.append(Comp.Image(file=options_img_path))
         
