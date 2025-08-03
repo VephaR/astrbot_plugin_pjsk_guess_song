@@ -175,12 +175,12 @@ class GuessSongPlugin(Star):  # type: ignore
         self.db_path = get_db_path(context, self.plugin_dir)
         init_db(self.db_path)
 
-        # Session and game management attributes
+        # 会话和游戏管理属性
         self.context.game_session_locks = getattr(self.context, "game_session_locks", {})
         self.context.active_game_sessions = getattr(self.context, "active_game_sessions", set())
         self.last_game_end_time = {}
         
-        # Song data and lists
+        # 歌曲数据和列表
         self.song_data = load_song_data(self.resources_dir)
         self.character_data = load_character_data(self.resources_dir)
 
@@ -189,12 +189,17 @@ class GuessSongPlugin(Star):  # type: ignore
         self.available_songs = []
         self.available_vocalist_songs = []
         self.bundle_to_song_map = {}
+        self.another_vocal_songs = []
         if self.song_data:
             for song_item in self.song_data:
                 self.available_songs.append(song_item)
                 if song_item.get("vocalists"):
                     self.available_vocalist_songs.append(song_item)
                 if 'vocals' in song_item and song_item['vocals']:
+                    # 填充包含 another_vocal 的歌曲列表
+                    if any(v.get('musicVocalType') == 'another_vocal' for v in song_item['vocals']):
+                        self.another_vocal_songs.append(song_item)
+                    
                     for vocal in song_item['vocals']:
                         bundle_name = vocal.get('vocalAssetbundleName')
                         if bundle_name:
@@ -205,7 +210,6 @@ class GuessSongPlugin(Star):  # type: ignore
         self.available_bass_songs = []
         self.available_drums_songs = []
         self.available_vocals_songs = []
-        self.another_vocal_songs = []
         self.available_piano_songs_bundles = set()
         self.preprocessed_tracks = {
             "accompaniment": set(), "bass_only": set(),
@@ -218,8 +222,9 @@ class GuessSongPlugin(Star):  # type: ignore
         self.max_plays_per_day = self.config.get("max_plays_per_day", 10)
         self.max_listen_per_day = self.config.get("max_listen_per_day", 10)
         self.game_cooldown_seconds = self.config.get("game_cooldown_seconds", 30)
+        self.lightweight_mode = self.config.get("lightweight_mode", False)
 
-        # Remote resources and manifest
+        # 远程资源和清单
         self.remote_manifest_url = self.config.get("remote_manifest_url")
         self.preprocessed_assets_url = self.config.get("preprocessed_assets_url")
         self.use_remote_resources = bool(self.remote_manifest_url and self.preprocessed_assets_url)
@@ -227,13 +232,13 @@ class GuessSongPlugin(Star):  # type: ignore
         self.http_session: Optional['aiohttp.ClientSession'] = None
         self.manifest_lock = asyncio.Lock()
 
-        # Stats server configuration (Corrected to read from self.config directly)
+        # 统计服务器配置（已修正为直接从 self.config 读取）
         self.api_key = self.config.get("stats_server_api_key")
         remote_url_base = self.config.get("remote_resource_url_base")
         if remote_url_base:
             try:
                 parsed_url = urlparse(remote_url_base)
-                # Assume stats server is on the same host but at port 5000
+                # 假设统计服务器在同一主机上，但端口为 5000
                 self.stats_server_url = f"{parsed_url.scheme}://{parsed_url.hostname}:5000"
             except Exception as e:
                 logger.error(f"无法从 '{remote_url_base}' 解析统计服务器地址: {e}")
@@ -252,18 +257,19 @@ class GuessSongPlugin(Star):  # type: ignore
             'vocals':     {'name': '纯人声'},
         }
 
-        # Game mode definitions
+        # 游戏模式定义
         self.game_modes = {
-            '1': {'name': '普通', 'kwargs': {}, 'score': 1},
-            '2': {'name': '2倍速', 'kwargs': {'speed_multiplier': 2.0},'score': 1},
-            '3': {'name': '倒放', 'kwargs': {'reverse_audio': True},'score': 3},
-            '4': {'name': '纯人声', 'kwargs': {'play_preprocessed': 'vocals_only'}, 'score': 1},
+            'normal': {'name': '普通', 'kwargs': {}, 'score': 1},
+            '1': {'name': '2倍速', 'kwargs': {'speed_multiplier': 2.0}, 'score': 1},
+            '2': {'name': '倒放', 'kwargs': {'reverse_audio': True}, 'score': 3},
+            '3': {'name': '钢琴旋律重现', 'kwargs': {'melody_to_piano': True}, 'score': 2},
+            '4': {'name': '纯伴奏', 'kwargs': {'play_preprocessed': 'accompaniment'}, 'score': 1},
             '5': {'name': '纯贝斯', 'kwargs': {'play_preprocessed': 'bass_only'}, 'score': 3},
             '6': {'name': '纯鼓组', 'kwargs': {'play_preprocessed': 'drums_only'}, 'score': 4},
-            '7': {'name': '纯伴奏', 'kwargs': {'play_preprocessed': 'accompaniment'}, 'score': 1}
+            '7': {'name': '纯人声', 'kwargs': {'play_preprocessed': 'vocals_only'}, 'score': 1},
         }
         
-        # Effects for random mode, deduced from game_modes and random guesser logic
+        # 随机模式的效果
         self.base_effects = [
             {'name': '2倍速', 'kwargs': {'speed_multiplier': 2.0}, 'group': 'speed', 'score': 1},
             {'name': '倒放', 'kwargs': {'reverse_audio': True}, 'group': 'direction', 'score': 3},
@@ -291,7 +297,7 @@ class GuessSongPlugin(Star):  # type: ignore
             self.mode_name_map[key] = key
             self.mode_name_map[value['name'].lower()] = key
         
-        # Final setup
+        # 最终设置
         if self.song_data:
             self._populate_song_lists()
         else:
@@ -394,7 +400,7 @@ class GuessSongPlugin(Star):  # type: ignore
 
     async def _periodic_cleanup_task(self):
         """每隔一小时自动清理一次 output 目录。"""
-        cleanup_interval_seconds = 3600 # 1 hour
+        cleanup_interval_seconds = 3600 # 1小时
         while True:
             await asyncio.sleep(cleanup_interval_seconds)
             logger.info("开始周期性清理 output 目录...")
@@ -475,7 +481,7 @@ class GuessSongPlugin(Star):  # type: ignore
         return sqlite3.connect(self.db_path)
 
     def _draw_options_image_sync(self, options: List[Dict], jacket_images: List[Optional[Image.Image]]) -> Optional[str]:
-        """[Helper] 同步的选项图片绘制函数"""
+        """[辅助函数] 同步的选项图片绘制函数"""
         jacket_w, jacket_h = 128, 128
         padding = 15
         text_h = 50 
@@ -793,7 +799,7 @@ class GuessSongPlugin(Star):  # type: ignore
             return None
 
     def _process_audio_with_pydub(self, audio_data: Union[str, Path, io.BytesIO], audio_format: str, options: dict) -> Optional['AudioSegment']:
-        """[Helper] 在线程池中执行的同步pydub处理逻辑"""
+        """[辅助函数] 在线程池中执行的同步pydub处理逻辑"""
         try:
             audio = AudioSegment.from_file(audio_data, format=audio_format)
 
@@ -1092,7 +1098,12 @@ class GuessSongPlugin(Star):  # type: ignore
         )
 
         match = re.search(r'(\d+)', event.message_str)
-        mode_key = match.group(1) if match else '1'
+        mode_key = match.group(1) if match else 'normal'
+
+        if self.lightweight_mode and mode_key in ['1', '2']:
+           original_mode_name = self.game_modes[mode_key]['name']
+           await event.send(event.plain_result(f"......轻量模式已启用，模式“{original_mode_name}”已自动切换为普通模式。"))
+           mode_key = 'normal'
         
         mode_config = self.game_modes.get(mode_key)
         if not mode_config:
@@ -1375,35 +1386,20 @@ class GuessSongPlugin(Star):  # type: ignore
 
     @filter.command("猜歌帮助")
     async def show_guess_song_help(self, event: AstrMessageEvent):
-        """显示猜歌插件帮助"""
+        """以图片形式显示猜歌插件帮助。"""
         if not self._is_group_allowed(event):
             return
-        help_text = (
-            "--- PJSK猜歌插件帮助 ---\n\n"
-            "🎵 基础指令\n"
-            "  猜歌 - 普通模式 (1分)\n"
-            "  猜歌 1 - 2倍速 (1分)\n"
-            "  猜歌 2 - 倒放 (3分)\n"
-            "  猜歌 3 - AI-Assisted Twin Piano ver. (2分)\n"
-            "  猜歌 4 - 纯伴奏模式 (1分)\n"
-            "  猜歌 5 - 纯贝斯模式 (3分)\n"
-            "  猜歌 6 - 纯鼓组模式 (4分)\n"
-            "  猜歌 7 - 纯人声模式 (1分)\n\n"
-            "🎲 高级指令\n"
-            "  随机猜歌 - 随机组合效果 (最高9分)\n"
-            "  猜歌手 - 竞猜演唱者 (测试功能, 不计分)\n"
-            "  听<模式> [歌曲名/ID] - 播放指定或随机歌曲的特殊音轨。\n"
-            "    可用模式: 钢琴, 伴奏, 人声, 贝斯, 鼓组\n"
-            "    (该功能有统一的每日次数限制)\n\n"
-            "📊 数据统计\n"
-            "  猜歌分数 - 查看自己的猜歌积分和排名\n"
-            "  群猜歌排行榜 - 查看本群猜歌排行榜\n"
-            "  本地猜歌排行榜 - 查看插件本地存储的猜歌排行榜\n"
-            "  猜歌排行榜 - 查看服务器猜歌总排行榜 (联网)\n"
-            "  同步分数 - (管理员)将本地总分同步至服务器\n"
-            "  查看统计 - 查看各题型的正确率排行"
-        )
-        await event.send(event.plain_result(help_text))
+
+        loop = asyncio.get_running_loop()
+        try:
+            img_path = await loop.run_in_executor(self.executor, self._draw_help_image_sync)
+            if img_path:
+                await event.send(event.image_result(img_path))
+            else:
+                await event.send(event.plain_result("生成帮助图片时出错。"))
+        except Exception as e:
+            logger.error(f"发送帮助图片时发生错误: {e}", exc_info=True)
+            await event.send(event.plain_result("生成帮助图片时出错，请查看日志。"))
 
     @filter.command("群猜歌排行榜", alias={"gssrank", "gstop"})
     async def show_ranking(self, event: AstrMessageEvent):
@@ -1433,7 +1429,7 @@ class GuessSongPlugin(Star):  # type: ignore
         return full_ranking[:10]
 
     def _draw_ranking_image_sync(self, rows, title_text="猜歌排行榜") -> Optional[str]:
-        """[Helper] 同步绘制排行榜图片，已适配服务器/本群两种模式"""
+        """[辅助函数] 同步绘制排行榜图片，已适配服务器/本群两种模式"""
         try:
             # 移植猜卡插件的排行榜生成逻辑以获得更好看的样式
             width, height = 650, 950
@@ -1475,7 +1471,7 @@ class GuessSongPlugin(Star):  # type: ignore
                 medal_font = body_font
 
             with Pilmoji(img) as pilmoji:
-                # title_text = "猜歌排行榜"
+                # 标题文本 = "猜歌排行榜"
                 # 修正：将浮点数坐标转换为整数
                 center_x, title_y = int(width / 2), 80
                 pilmoji.text((center_x + 2, title_y + 2), title_text, font=title_font, fill=shadow_color, anchor="mm")
@@ -1560,7 +1556,7 @@ class GuessSongPlugin(Star):  # type: ignore
             await event.send(event.plain_result("......目前还没有人参与过猜歌游戏"))
             return
             
-        # Re-format rows for the drawing function
+        # 为绘图函数重新格式化行数据
         formatted_rows = [(row[0], row[1], row[2], row[3], row[4]) for row in rows]
 
         img_path = await loop.run_in_executor(
@@ -1606,7 +1602,7 @@ class GuessSongPlugin(Star):  # type: ignore
             yield event.plain_result("......服务器排行榜上还没有任何数据。")
             return
 
-        # 修正：将从服务器获取的原始数据，正确地适配到绘图函数所需的 (user_id, user_name, score, attempts, correct_attempts) 格式
+        # 为绘图函数重新格式化行数据
         formatted_rows = [
             (
                 r.get('user_id'),
@@ -1732,7 +1728,7 @@ class GuessSongPlugin(Star):  # type: ignore
         await event.send(event.plain_result("\n\n".join(result_parts)))
 
     def _get_user_daily_limits_sync(self, user_id: str) -> Tuple[bool, int]:
-        """[Helper] 同步获取用户每日听歌限制。返回 (是否可听, 오늘听歌次数)"""
+        """[辅助函数] 同步获取用户每日听歌限制。返回 (是否可听, 今天听歌次数)"""
         listen_limit = self.config.get("daily_listen_limit", 5)
         with self.get_conn() as conn:
             cursor = conn.cursor()
@@ -1746,10 +1742,10 @@ class GuessSongPlugin(Star):  # type: ignore
                 return daily_listen < listen_limit, daily_listen
             return True, 0
     
-    # --- Data and state management methods ---
+    # --- 数据和状态管理方法 ---
     def _record_game_start(self, user_id: str, user_name: str):
-        # This method is now a placeholder. The logic is handled in _update_stats and _run_game_session.
-        # It's kept for potential future use or compatibility.
+        # 此方法现在是占位符。逻辑在 _update_stats 和 _run_game_session 中处理。
+        # 保留它是为了将来潜在的使用或兼容性。
         pass
 
     def _record_listen_song(self, user_id: str, user_name: str, session_id: str):
@@ -2821,7 +2817,7 @@ class GuessSongPlugin(Star):  # type: ignore
         return {"score": 0, "rank": None, "attempts": 0, "correct_attempts": 0}
 
     def _get_user_local_global_stats_sync(self, user_id: str) -> Optional[Dict]:
-        """[Helper] 同步获取用户的本地全局统计数据（用于备用和每日次数）。"""
+        """[辅助函数] 同步获取用户的本地全局统计数据（用于备用和每日次数）。"""
         with self.get_conn() as conn:
             cursor = conn.cursor()
             cursor.execute("""
@@ -2854,7 +2850,7 @@ class GuessSongPlugin(Star):  # type: ignore
         """
         combinations_by_score = defaultdict(list)
 
-        # 1. 筛选出当前可玩的“音源类”效果
+        # 1. 筛选出当前可玩的"音源类"效果
         playable_source_effects = []
         for effect in self.source_effects:
             kwargs = effect.get('kwargs', {})
@@ -2868,7 +2864,7 @@ class GuessSongPlugin(Star):  # type: ignore
             else:  # 假设普通模式总是可用
                 playable_source_effects.append(effect)
 
-        # 2. 构建“独立类”效果的选项（开启/关闭）
+        # 2. 构建"独立类"效果的选项（开启/关闭）
         independent_options = []
         for effect in self.base_effects:
             # (开启效果, 关闭效果)
@@ -2939,4 +2935,112 @@ class GuessSongPlugin(Star):  # type: ignore
         probabilities = [w / total_weight for w in weights]
         
         return dict(zip(scores, probabilities))
+
+    def _draw_help_image_sync(self) -> Optional[str]:
+        """[辅助函数] 同步绘制帮助图片。"""
+        try:
+            width, height = 800, 1350
+            bg_color_start, bg_color_end = (230, 240, 255), (200, 210, 240)
+            img = Image.new("RGB", (width, height), bg_color_start)
+            draw_bg = ImageDraw.Draw(img)
+            for y in range(height):
+                r = int(bg_color_start[0] + (bg_color_end[0] - bg_color_start[0]) * y / height)
+                g = int(bg_color_start[1] + (bg_color_end[1] - bg_color_start[1]) * y / height)
+                b = int(bg_color_start[2] + (bg_color_end[2] - bg_color_start[2]) * y / height)
+                draw_bg.line([(0, y), (width, y)], fill=(r, g, b))
+
+            background_path = self.resources_dir / "ranking_bg.png"
+            if background_path.exists():
+                try:
+                    custom_bg = Image.open(background_path).convert("RGBA").resize((width, height), LANCZOS)
+                    custom_bg.putalpha(128)
+                    img = img.convert("RGBA")
+                    img = Image.alpha_composite(img, custom_bg)
+                except Exception as e:
+                    logger.warning(f"加载或混合自定义背景图片失败: {e}")
+
+            if img.mode != 'RGBA': img = img.convert('RGBA')
+            white_overlay = Image.new("RGBA", img.size, (255, 255, 255, 100))
+            img = Image.alpha_composite(img, white_overlay)
+
+            font_color, shadow_color = (30, 30, 50), (180, 180, 190, 128)
+            header_color = (80, 90, 120)
+            
+            try:
+                font_path = str(self.resources_dir / "font.ttf")
+                title_font = ImageFont.truetype(font_path, 48)
+                section_font = ImageFont.truetype(font_path, 32)
+                body_font = ImageFont.truetype(font_path, 24)
+                id_font = ImageFont.truetype(font_path, 16)
+            except IOError:
+                title_font = ImageFont.load_default(size=48)
+                section_font = ImageFont.load_default(size=32)
+                body_font = ImageFont.load_default(size=24)
+                id_font = ImageFont.load_default(size=16)
+
+            help_text = (
+                "--- PJSK猜歌插件帮助 ---\n\n"
+                "🎵 基础指令\n"
+                f"  `猜歌` - {self.game_modes['normal']['name']} ({self.game_modes['normal']['score']}分)\n"
+                f"  `猜歌 1` - {self.game_modes['1']['name']} ({self.game_modes['1']['score']}分)\n"
+                f"  `猜歌 2` - {self.game_modes['2']['name']} ({self.game_modes['2']['score']}分)\n"
+                f"  `猜歌 3` - {self.game_modes['3']['name']} ({self.game_modes['3']['score']}分)\n"
+                f"  `猜歌 4` - {self.game_modes['4']['name']} ({self.game_modes['4']['score']}分)\n"
+                f"  `猜歌 5` - {self.game_modes['5']['name']} ({self.game_modes['5']['score']}分)\n"
+                f"  `猜歌 6` - {self.game_modes['6']['name']} ({self.game_modes['6']['score']}分)\n"
+                f"  `猜歌 7` - {self.game_modes['7']['name']} ({self.game_modes['7']['score']}分)\n\n"
+                "🎲 高级指令\n"
+                "  `随机猜歌` - 随机组合效果 (最高9分)\n"
+                "  `猜歌手` - 竞猜演唱者 (测试功能, 不计分)\n"
+                "  `听<模式> [歌名/ID]` - 播放指定或随机歌曲的特殊音轨。\n"
+                "    可用模式: 钢琴, 伴奏, 人声, 贝斯, 鼓组\n"
+                "    (该功能有统一的每日次数限制)\n\n"
+                "📊 数据统计\n"
+                "  `猜歌分数` - 查看自己的猜歌积分和排名\n"
+                "  `群猜歌排行榜` - 查看本群猜歌排行榜\n"
+                "  `本地猜歌排行榜` - 查看插件本地存储的猜歌排行榜\n"
+                "  `猜歌排行榜` - 查看服务器猜歌总排行榜 (联网)\n"
+                "  `同步分数` - (管理员)将本地总分同步至服务器\n"
+                "  `查看统计` - 查看各题型的正确率排行"
+            )
+
+            with Pilmoji(img) as pilmoji:
+                center_x, current_y = width // 2, 80
+                x_margin = 60
+                line_height_body = 40
+                line_height_section = 55
+                
+                lines = help_text.split('\n')
+                
+                title_text = lines[0].replace("---", "").strip()
+                pilmoji.text((int(center_x) + 2, int(current_y) + 2), title_text, font=title_font, fill=shadow_color, anchor="mm")
+                pilmoji.text((int(center_x), int(current_y)), title_text, font=title_font, fill=font_color, anchor="mm")
+                current_y += 100
+
+                for line in lines[2:]:
+                    if not line.strip():
+                        current_y += line_height_body // 2
+                        continue
+
+                    if line.startswith("🎵") or line.startswith("🎲") or line.startswith("📊"):
+                        font = section_font
+                        y_increment = line_height_section
+                        text_to_draw = line.strip()
+                    else:
+                        font = body_font
+                        y_increment = line_height_body
+                        text_to_draw = line
+
+                    pilmoji.text((x_margin, int(current_y)), text_to_draw, font=font, fill=font_color)
+                    current_y += y_increment
+                
+                footer_text = f"GuessSong v{PLUGIN_VERSION} | Generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                pilmoji.text((int(center_x), height - 40), footer_text, font=id_font, fill=header_color, anchor="ms")
+            
+            img_path = self.output_dir / f"guess_song_help_{int(time.time())}.png"
+            img.save(img_path)
+            return str(img_path)
+        except Exception as e:
+            logger.error(f"生成帮助图片时出错: {e}", exc_info=True)
+            return None
 
