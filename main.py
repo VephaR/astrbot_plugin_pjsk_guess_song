@@ -997,77 +997,6 @@ class GuessSongPlugin(Star):  # type: ignore
             
         await event.send(event.chain_result(answer_reveal_messages))
 
-    async def _start_game_logic(self, event: AstrMessageEvent, **kwargs):
-        """猜歌游戏核心逻辑(准备阶段)，已从旧代码恢复并适配"""
-        can_start, message = await self._check_game_start_conditions(event)
-        if not can_start:
-            if message:
-                await event.send(event.plain_result(message))
-            return
-
-        session_id = event.unified_msg_origin
-        debug_mode = self.config.get("debug_mode", False)
-
-        # 标记会话并记录次数
-        self.context.active_game_sessions.add(session_id)
-        # --- 恢复：发送统计信标 ---
-        asyncio.create_task(self._send_stats_ping("guess_song"))
-        if not debug_mode:
-            self._record_game_start(event.get_sender_id(), event.get_sender_name())
-        
-        # 将同步的音频处理任务扔到线程池中执行
-        try:
-            loop = asyncio.get_running_loop()
-            game_data_callable = partial(self.start_new_game, **kwargs)
-            game_data = await loop.run_in_executor(
-                self.executor, game_data_callable
-            )
-        except Exception as e:
-            logger.error(f"在线程池中执行 start_new_game 失败: {e}", exc_info=True)
-            game_data = None
-
-        if not game_data:
-            await event.send(event.plain_result("......开始游戏失败，可能是缺少资源文件、配置错误或ffmpeg未安装，请联系管理员。"))
-            if session_id in self.context.active_game_sessions:
-                self.context.active_game_sessions.remove(session_id)
-            return
-        
-        if not self.available_songs:
-            await event.send(event.plain_result("......歌曲数据未加载，无法生成选项。"))
-            if session_id in self.context.active_game_sessions:
-                self.context.active_game_sessions.remove(session_id)
-            return
-
-        # 准备选项
-        correct_song = game_data['song']
-        # --- 适配：使用 self.available_songs 而不是 self.songs_data ---
-        other_songs = random.sample([s for s in self.available_songs if s['id'] != correct_song['id']], 11)
-        options = [correct_song] + other_songs
-        random.shuffle(options)
-        
-        # 更新游戏数据
-        game_data['options'] = options
-        game_data['correct_answer_num'] = options.index(correct_song) + 1
-        
-        logger.info(f"[猜歌插件] 新游戏开始. 答案: {correct_song['title']} (选项 {game_data['correct_answer_num']})")
-        
-        # 准备消息
-        options_img_path = await self._create_options_image(options)
-        timeout_seconds = self.config.get("answer_timeout", 30)
-        intro_text = f".......嗯\n这首歌是？请在{timeout_seconds}秒内发送编号回答。\n"
-        
-        intro_messages = [Comp.Plain(intro_text)]
-        if options_img_path:
-            intro_messages.append(Comp.Image(file=options_img_path))
-            
-        jacket_path = self._get_resource_path_or_url(f"music_jacket/{correct_song['jacketAssetbundleName']}.png")
-        answer_reveal_messages = [
-                Comp.Plain(f"正确答案是: {game_data['correct_answer_num']}. {correct_song['title']}\n"),
-                Comp.Image(file=str(jacket_path))
-            ]
-
-        # 启动游戏会话
-        await self._run_game_session(event, game_data, intro_messages, answer_reveal_messages)
 
     @filter.command(
         "猜歌",
@@ -2680,32 +2609,6 @@ class GuessSongPlugin(Star):  # type: ignore
         except Exception as e:
             logger.warning(f"发送分数更新至 {post_url} 失败: {e}")
 
-    async def _send_stats_ping(self, game_type: str):
-        """向专用统计服务器的5000端口发送GET请求。"""
-        # --- 核心恢复：使用旧的、能工作的统计逻辑 ---
-        stats_url = self.config.get("remote_statistics_url")
-        if not stats_url:
-            return
-
-        try:
-            parsed_url = urlparse(stats_url)
-            stats_server_root = f"{parsed_url.scheme}://{parsed_url.hostname}:5000"
-            ping_url = f"{stats_server_root}/stats_ping/{game_type}.ping"
-
-            loop = asyncio.get_running_loop()
-            loop.run_in_executor(self.executor, self._execute_ping_request, ping_url)
-        except Exception as e:
-            logger.error(f"无法调度统计ping任务: {e}")
-
-    def _execute_ping_request(self, ping_url: str):
-        """[辅助函数] 同步执行 ping 请求的函数。设计用于 ThreadPoolExecutor。"""
-        try:
-            # urlopen 是一个阻塞调用，非常适合在执行器中使用。
-            with urlopen(ping_url, timeout=2):
-                pass  # 我们只需要发出请求即可。
-        except Exception as e:
-            # 最好记录此信息以进行调试，即使我们不让它崩溃。
-            logger.warning(f"Stats ping to {ping_url} failed: {e}")
 
     async def _api_get_user_global_stats(self, user_id: str) -> Optional[Dict]:
         """通过API获取用户的服务器统计数据。"""
