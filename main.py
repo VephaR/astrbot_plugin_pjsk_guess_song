@@ -734,12 +734,14 @@ class GuessSongPlugin(Star):  # type: ignore
                 mode = "normal"
                 if kwargs.get("random_mode_name"):
                     mode = kwargs["random_mode_name"]
+                elif kwargs.get('game_type') == 'guess_song_vocalist':
+                    mode = 'guess_song_vocalist'
                 elif preprocessed_mode:
                     mode = preprocessed_mode
                 elif is_piano_mode:
                     mode = "melody_to_piano"
                 
-                return {"song": song, "clip_path": str(clip_path_obj), "score": kwargs.get("score", 1), "mode": mode}
+                return {"song": song, "clip_path": str(clip_path_obj), "score": kwargs.get("score", 1), "mode": mode, "game_type": kwargs.get('game_type')}
 
             except Exception as e:
                 logger.warning(f"快速路径处理失败: {e}. 将回退到 pydub 慢速路径。")
@@ -784,6 +786,8 @@ class GuessSongPlugin(Star):  # type: ignore
             mode = "normal"
             if kwargs.get("random_mode_name"):
                 mode = kwargs["random_mode_name"]
+            elif kwargs.get('game_type') == 'guess_song_vocalist':
+                mode = 'guess_song_vocalist'
             elif preprocessed_mode:
                 mode = preprocessed_mode
             elif is_piano_mode:
@@ -792,7 +796,7 @@ class GuessSongPlugin(Star):  # type: ignore
             clip_path = self.output_dir / f"clip_{int(time.time())}.mp3"
             clip.export(clip_path, format="mp3", bitrate="128k")
 
-            return {"song": song, "clip_path": str(clip_path), "score": kwargs.get("score", 1), "mode": mode}
+            return {"song": song, "clip_path": str(clip_path), "score": kwargs.get("score", 1), "mode": mode, "game_type": kwargs.get('game_type')}
 
         except Exception as e:
             logger.error(f"慢速路径 (pydub) 处理音频文件 {audio_source} 时失败: {e}", exc_info=True)
@@ -934,7 +938,7 @@ class GuessSongPlugin(Star):  # type: ignore
                 if can_score:
                     score_to_add = game_data.get("score", 1)
 
-            if game_data.get("game_type", "guess_song") == "guess_song":
+            if game_data.get('game_type', '').startswith('guess_song'):
                 loop = asyncio.get_running_loop()
                 await loop.run_in_executor(self.executor, self._update_stats, session_id, user_id, user_name, score_to_add, is_correct)
                 if score_to_add > 0:
@@ -945,7 +949,7 @@ class GuessSongPlugin(Star):  # type: ignore
                 
                 # 修改：将游戏结果暂存，游戏结束后统一发送
                 game_results_to_log.append({
-                    "game_type": 'guess_song',
+                    "game_type": game_data.get('game_type', 'guess_song'),
                     "game_mode": game_data['mode'], # 修正：同上
                     "user_id": user_id,
                     "user_name": user_name,
@@ -1272,10 +1276,13 @@ class GuessSongPlugin(Star):  # type: ignore
             game_data = await self.start_new_game(
                 force_song_object=song,
                 force_vocal_version=correct_vocal_version,
-                speed_multiplier=1.5
+                speed_multiplier=1.5,
+                game_type='guess_song_vocalist',
+                guess_type='vocalist',
+                mode_name='猜歌手'
             )
         except Exception as e:
-            logger.error(f"执行 start_new_game 失败: {e}", exc_info=True)
+            logger.error(f"在 start_new_game (猜歌手) 中发生错误: {e}", exc_info=True)
             game_data = None
 
         if not game_data:
@@ -1288,8 +1295,7 @@ class GuessSongPlugin(Star):  # type: ignore
         random.shuffle(another_vocals)
         game_data['num_options'] = len(another_vocals)
         game_data['correct_answer_num'] = another_vocals.index(correct_vocal_version) + 1
-        game_data['game_mode'] = 'vocalist' # 标记为猜歌手模式
-        game_data['game_type'] = 'vocalist'
+        game_data['game_mode'] = 'vocalist' # 标记为猜歌手模式，用于答案判断
 
         def get_vocalist_name(vocal_info):
             char_ids = [c['characterId'] for c in vocal_info.get('characters', [])]
