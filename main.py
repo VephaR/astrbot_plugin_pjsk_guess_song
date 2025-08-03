@@ -740,6 +740,12 @@ class GuessSongPlugin(Star):  # type: ignore
                     mode = preprocessed_mode
                 elif is_piano_mode:
                     mode = "melody_to_piano"
+                elif kwargs.get('reverse_audio'):
+                # 对应 game_modes 中的模式 '2'
+                    mode = 'reverse_audio'
+                elif kwargs.get('speed_multiplier'):
+                # 对应 game_modes 中的模式 '1'
+                    mode = 'speed_multiplier'
                 
                 return {"song": song, "clip_path": str(clip_path_obj), "score": kwargs.get("score", 1), "mode": mode, "game_type": kwargs.get('game_type')}
 
@@ -792,6 +798,12 @@ class GuessSongPlugin(Star):  # type: ignore
                 mode = preprocessed_mode
             elif is_piano_mode:
                 mode = "melody_to_piano"
+            elif kwargs.get('reverse_audio'):
+                # 对应 game_modes 中的模式 '2'
+                mode = 'reverse_audio'
+            elif kwargs.get('speed_multiplier'):
+                # 对应 game_modes 中的模式 '1'
+                mode = 'speed_multiplier'
             
             clip_path = self.output_dir / f"clip_{int(time.time())}.mp3"
             clip.export(clip_path, format="mp3", bitrate="128k")
@@ -1051,7 +1063,21 @@ class GuessSongPlugin(Star):  # type: ignore
             return
             
         game_kwargs = mode_config['kwargs'].copy()
-        game_kwargs['game_type'] = 'guess_song'
+
+        # 优化：优先使用预处理模式名作为game_type，否则使用mode_key
+        if 'play_preprocessed' in game_kwargs:
+            game_type_suffix = game_kwargs['play_preprocessed']
+        elif 'melody_to_piano' in game_kwargs:
+            game_type_suffix = 'piano'
+        elif 'reverse_audio' in game_kwargs:
+            game_type_suffix = 'reverse'
+        elif 'speed_multiplier' in game_kwargs:
+            game_type_suffix = 'speed_2x'
+        else:
+            game_type_suffix = 'normal'
+            
+        game_kwargs['game_type'] = f"guess_song_{game_type_suffix}"
+
 
         self._record_game_start(event.get_sender_id(), event.get_sender_name())
         asyncio.create_task(self._api_ping("guess_song"))
