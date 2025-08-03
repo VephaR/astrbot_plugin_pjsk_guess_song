@@ -1050,7 +1050,8 @@ class GuessSongPlugin(Star):  # type: ignore
                 self.context.active_game_sessions.remove(session_id)
             return
             
-        game_kwargs = mode_config['kwargs']
+        game_kwargs = mode_config['kwargs'].copy()
+        game_kwargs['game_type'] = 'guess_song'
 
         self._record_game_start(event.get_sender_id(), event.get_sender_name())
         asyncio.create_task(self._api_ping("guess_song"))
@@ -1152,6 +1153,7 @@ class GuessSongPlugin(Star):  # type: ignore
         combined_kwargs = chosen_processed_combo['final_kwargs']
         total_score = chosen_processed_combo['final_score']
         combined_kwargs['score'] = total_score
+        combined_kwargs['game_type'] = 'guess_song_random'
         
         effect_names = [eff['name'] for eff in chosen_processed_combo['effects_list']]
         
