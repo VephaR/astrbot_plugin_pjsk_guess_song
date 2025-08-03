@@ -1986,6 +1986,12 @@ class GuessSongPlugin(Star):  # type: ignore
             self._cleanup_task.cancel()
         if hasattr(self, '_manifest_load_task') and self._manifest_load_task:
             self._manifest_load_task.cancel()
+        
+        # 新增：安全地关闭 aiohttp session
+        if self.http_session and not self.http_session.closed:
+            await self.http_session.close()
+            logger.info("aiohttp session 已关闭。")
+
         self.executor.shutdown(wait=False)
         logger.info("猜歌插件已终止。")
 
