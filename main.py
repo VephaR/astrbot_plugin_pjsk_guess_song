@@ -2045,7 +2045,7 @@ class GuessSongPlugin(Star):  # type: ignore
         stats.sort(key=lambda x: x[3])  # 按正确率升序
         
         # 在线程池中生成图片
-        img_path = await loop.run_in_executor(self.executor, self._draw_mode_stats_image_sync, stats)
+        img_path = await loop.run_in_executor(self.executor, self._draw_mode_stats_image_sync, stats[:10])
 
         if img_path:
             yield event.image_result(img_path) 
