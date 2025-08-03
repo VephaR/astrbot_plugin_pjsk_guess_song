@@ -18,7 +18,6 @@ import itertools
 from functools import partial
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse
-from urllib.request import urlopen
 from collections import defaultdict
 
 try:
