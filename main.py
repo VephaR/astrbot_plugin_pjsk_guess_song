@@ -1419,7 +1419,7 @@ class GuessSongPlugin(Star):  # type: ignore
             return
 
         img_path = await loop.run_in_executor(
-            self.executor, self._draw_ranking_image_sync, rows, "本群猜歌排行榜"
+            self.executor, self._draw_ranking_image_sync, rows[:10], "本群猜歌排行榜"
         )
         if img_path:
             await event.send(event.image_result(img_path))
@@ -1564,7 +1564,7 @@ class GuessSongPlugin(Star):  # type: ignore
         formatted_rows = [(row[0], row[1], row[2], row[3], row[4]) for row in rows]
 
         img_path = await loop.run_in_executor(
-            self.executor, self._draw_ranking_image_sync, formatted_rows, "本地总排行榜"
+            self.executor, self._draw_ranking_image_sync, formatted_rows[:10], "本地总排行榜"
         )
         if img_path:
             await event.send(event.image_result(img_path))
@@ -1620,7 +1620,7 @@ class GuessSongPlugin(Star):  # type: ignore
 
         try:
             loop = asyncio.get_running_loop()
-            img_path = await loop.run_in_executor(self.executor, self._draw_ranking_image_sync, formatted_rows, "服务器猜歌总排行榜")
+            img_path = await loop.run_in_executor(self.executor, self._draw_ranking_image_sync, formatted_rows[:10], "服务器猜歌排行榜")
             if img_path:
                 yield event.image_result(img_path)
             else:
