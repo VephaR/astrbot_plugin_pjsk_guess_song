@@ -5,7 +5,7 @@ import time
 import os
 import sqlite3
 import re
-import subprocess  # 新增
+import subprocess
 import io
 from typing import List, Dict, Optional, Tuple, Union
 from pathlib import Path
@@ -59,8 +59,8 @@ except ImportError:
     class StarTools:
         @staticmethod
         def get_data_dir(plugin_name: str) -> Path:
-            # Provide a fallback implementation that mimics the original get_db_path logic
-            # This path is relative to the directory containing the 'plugins' folder
+            # 提供一个回退实现，模拟原始的 get_db_path 逻辑
+            # 此路径是相对于包含 'plugins' 文件夹的目录
             return Path(__file__).parent.parent.parent.parent / 'data' / 'plugins_data' / plugin_name
 
 
@@ -1082,6 +1082,17 @@ class GuessSongPlugin(Star):  # type: ignore
         session_id = event.unified_msg_origin
         lock = self.context.game_session_locks.setdefault(session_id, asyncio.Lock())
         
+        # 1. 解析模式
+        match = re.search(r'(\d+)', event.message_str)
+        mode_key = match.group(1) if match else 'normal'
+
+        # 2. 轻量模式处理
+        if self.lightweight_mode and mode_key in ['1', '2']:
+            original_mode_name = self.game_modes[mode_key]['name']
+            await event.send(event.plain_result(f'......轻量模式已启用，模式"{original_mode_name}"已自动切换为普通模式。'))
+            mode_key = 'normal'
+        
+        # 3. 锁定并检查条件
         async with lock:
             can_start, message = await self._check_game_start_conditions(event)
             if not can_start:
@@ -1090,6 +1101,7 @@ class GuessSongPlugin(Star):  # type: ignore
                 return
             self.context.active_game_sessions.add(session_id)
 
+        # 4. 游戏确认开始，消耗次数
         initiator_id = event.get_sender_id()
         initiator_name = event.get_sender_name()
         loop = asyncio.get_running_loop()
@@ -1097,14 +1109,7 @@ class GuessSongPlugin(Star):  # type: ignore
             self.executor, self._consume_daily_play_attempt_sync, initiator_id, initiator_name
         )
 
-        match = re.search(r'(\d+)', event.message_str)
-        mode_key = match.group(1) if match else 'normal'
-
-        if self.lightweight_mode and mode_key in ['1', '2']:
-           original_mode_name = self.game_modes[mode_key]['name']
-           await event.send(event.plain_result(f"......轻量模式已启用，模式“{original_mode_name}”已自动切换为普通模式。"))
-           mode_key = 'normal'
-        
+        # 5. 获取配置并开始游戏
         mode_config = self.game_modes.get(mode_key)
         if not mode_config:
             await event.send(event.plain_result(f"......未知的猜歌模式 '{mode_key}'。"))
@@ -1963,7 +1968,7 @@ class GuessSongPlugin(Star):  # type: ignore
         """同步重置指定用户的每日游戏次数。"""
         with self.get_conn() as conn:
             cursor = conn.cursor()
-            # This resets the daily count across all sessions for the user.
+            # 这会重置该用户在所有会话中的每日计数。
             cursor.execute("UPDATE user_stats SET daily_games_played = 0 WHERE user_id = ?", (target_id,))
             conn.commit()
             return cursor.rowcount > 0
@@ -2085,14 +2090,14 @@ class GuessSongPlugin(Star):  # type: ignore
             yield event.plain_result("生成统计图片时出错。")
 
     def _get_mode_stats_sync(self):
-        """[Helper] 同步获取题型统计数据"""
+        """[辅助函数] 同步获取题型统计数据"""
         with self.get_conn() as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT mode, total_attempts, correct_attempts FROM mode_stats")
             return cursor.fetchall()
 
     def _draw_mode_stats_image_sync(self, stats) -> Optional[str]:
-        """[Helper] 同步绘制题型统计图片"""
+        """[辅助函数] 同步绘制题型统计图片"""
         try:
             # 固定排行榜分辨率
             width, height = 650, 950
@@ -2284,17 +2289,15 @@ class GuessSongPlugin(Star):  # type: ignore
         correct_answer_num = options.index(correct_song) + 1
         options_img_path = await self._create_options_image(options)
         
-        effects_text = "、".join(sorted(list(set(effect_names)))) or "普通"
-        intro_text = f"--- 测试模式 ---\n歌曲: {correct_song['title']}\n效果: {effects_text} (理论分数: {total_score})\n"
+        applied_effects = "、".join(effect_names)
+        intro_text = f"--- 调试模式 ---\n歌曲: {correct_song['title']}\n效果: {applied_effects}\n答案: {correct_answer_num}"
         
-        msg_chain = [Comp.Plain(intro_text)]
+        messages = [Comp.Plain(intro_text)]
         if options_img_path:
             msg_chain.append(Comp.Image(file=options_img_path))
         
         await event.send(event.chain_result(msg_chain))
-        await asyncio.sleep(0.5)
         await event.send(event.chain_result([Comp.Record(file=game_data["clip_path"])]))
-        await asyncio.sleep(0.5)
 
         jacket_source = self._get_resource_path_or_url(f"music_jacket/{correct_song['jacketAssetbundleName']}.png")
         answer_msg = [Comp.Plain(f"[测试模式] 正确答案是: {correct_answer_num}. {correct_song['title']}\n")]
@@ -2531,7 +2534,7 @@ class GuessSongPlugin(Star):  # type: ignore
 
     @filter.command("同步分数", alias={"syncscore", "migrategs"})
     async def sync_scores_to_server(self, event: AstrMessageEvent):
-        """(管理员) 将本地所有玩家分数数据一次性同步至服务器排行榜。"""
+        """（管理员）将所有用户的本地总分同步到服务器。"""
         if str(event.get_sender_id()) not in self.config.get("super_users", []):
             yield event.plain_result("......权限不足，只有管理员才能执行此操作。")
             return
@@ -2590,7 +2593,7 @@ class GuessSongPlugin(Star):  # type: ignore
 
 
     def _get_user_local_global_stats_sync(self, user_id: str) -> Optional[Dict]:
-        """[Helper] 同步获取用户的本地全局统计数据（用于备用和每日次数）。"""
+        """[辅助函数] 同步获取用户的本地全局统计数据（用于备用和每日次数）。"""
         with self.get_conn() as conn:
             cursor = conn.cursor()
             cursor.execute("""
@@ -2695,13 +2698,13 @@ class GuessSongPlugin(Star):  # type: ignore
             logger.error(f"无法调度统计ping任务: {e}")
 
     def _execute_ping_request(self, ping_url: str):
-        """[Helper] Synchronous function to execute the ping request. Meant for ThreadPoolExecutor."""
+        """[辅助函数] 同步执行 ping 请求的函数。设计用于 ThreadPoolExecutor。"""
         try:
-            # urlopen is a blocking call, perfect for the executor.
+            # urlopen 是一个阻塞调用，非常适合在执行器中使用。
             with urlopen(ping_url, timeout=2):
-                pass  # We just need the request to be made.
+                pass  # 我们只需要发出请求即可。
         except Exception as e:
-            # It's better to log this for debugging, even if we don't let it crash.
+            # 最好记录此信息以进行调试，即使我们不让它崩溃。
             logger.warning(f"Stats ping to {ping_url} failed: {e}")
 
     async def _api_get_user_global_stats(self, user_id: str) -> Optional[Dict]:
@@ -2732,8 +2735,12 @@ class GuessSongPlugin(Star):  # type: ignore
 
     def _get_full_group_ranking_sync(self, session_id: str) -> List[Tuple]:
         """
-        [核心数据源] 获取指定群组的完整、已排序的玩家列表。
-        返回一个元组列表: (user_id, user_name, score, attempts, correct_attempts)，只包含分数大于0的玩家。
+        [核心] 从本地数据库获取指定群聊的完整排行榜。
+        - 从 user_stats 表中筛选出所有在该群聊中有记录的用户。
+        - 解析每个用户的 group_scores JSON。
+        - 提取该群聊的分数、尝试次数、正确次数。
+        - 过滤掉分数为0的玩家。
+        - 按分数降序排序后返回。
         """
         with self.get_conn() as conn:
             cursor = conn.cursor()
@@ -2866,7 +2873,9 @@ class GuessSongPlugin(Star):  # type: ignore
 
         # 2. 构建"独立类"效果的选项（开启/关闭）
         independent_options = []
-        for effect in self.base_effects:
+        # 如果启用了轻量模式，则不使用变速、倒放等效果
+        active_base_effects = [] if self.lightweight_mode else self.base_effects
+        for effect in active_base_effects:
             # (开启效果, 关闭效果)
             independent_options.append([effect, {'name': 'Off', 'score': 0, 'kwargs': {}}])
 
