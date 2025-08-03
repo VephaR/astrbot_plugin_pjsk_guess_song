@@ -262,7 +262,7 @@ class GuessSongPlugin(Star):  # type: ignore
             'normal': {'name': '普通', 'kwargs': {}, 'score': 1},
             '1': {'name': '2倍速', 'kwargs': {'speed_multiplier': 2.0}, 'score': 1},
             '2': {'name': '倒放', 'kwargs': {'reverse_audio': True}, 'score': 3},
-            '3': {'name': '钢琴旋律重现', 'kwargs': {'melody_to_piano': True}, 'score': 2},
+            '3': {'name': 'AI-Assisted Twin Piano ver.', 'kwargs': {'melody_to_piano': True}, 'score': 2},
             '4': {'name': '纯伴奏', 'kwargs': {'play_preprocessed': 'accompaniment'}, 'score': 1},
             '5': {'name': '纯贝斯', 'kwargs': {'play_preprocessed': 'bass_only'}, 'score': 3},
             '6': {'name': '纯鼓组', 'kwargs': {'play_preprocessed': 'drums_only'}, 'score': 4},
