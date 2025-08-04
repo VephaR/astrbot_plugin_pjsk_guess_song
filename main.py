@@ -12,8 +12,6 @@ from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 from datetime import datetime
 from pilmoji import Pilmoji
-import sys
-import traceback
 import itertools
 from functools import partial
 from concurrent.futures import ThreadPoolExecutor
