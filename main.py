@@ -143,15 +143,28 @@ def load_song_data(resources_dir: Path) -> Optional[List[Dict]]:
         return None
 
 
-def load_character_data(resources_dir: Path) -> Dict[str, str]:
-    """加载 characters.json 数据"""
+def load_character_data(resources_dir: Path) -> Dict[str, Dict]:
+    """
+    加载角色数据，将角色ID映射到完整的角色信息字典。
+    """
+    characters_path = resources_dir / "characters.json"
+    if not characters_path.exists():
+        logger.warning(f"角色数据文件未找到: {characters_path}")
+        return {}
+    
     try:
-        char_file = resources_dir / "characters.json"
-        with open(char_file, "r", encoding="utf-8") as f:
-            chars = json.load(f)
-            return {str(c['characterId']): c['name'] for c in chars}
-    except FileNotFoundError:
-        logger.error("加载角色数据失败: 'characters.json' 未找到。")
+        with open(characters_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        
+        # 将角色ID映射到完整的角色信息
+        char_map = {
+            str(item.get("characterId")): item
+            for item in data if item.get("characterId")
+        }
+        return char_map
+
+    except (json.JSONDecodeError, IOError) as e:
+        logger.error(f"加载或解析角色数据失败: {e}")
         return {}
 
 
@@ -180,6 +193,10 @@ class GuessSongPlugin(Star):  # type: ignore
         # 歌曲数据和列表
         self.song_data = load_song_data(self.resources_dir)
         self.character_data = load_character_data(self.resources_dir)
+        self.abbr_to_char_id = {
+            char_info['name'].lower(): int(char_id)
+            for char_id, char_info in self.character_data.items() if char_info.get('name')
+        }
 
         self.random_mode_decay_factor = self.config.get("random_mode_decay_factor", 0.75)
         
@@ -201,6 +218,18 @@ class GuessSongPlugin(Star):  # type: ignore
                         bundle_name = vocal.get('vocalAssetbundleName')
                         if bundle_name:
                             self.bundle_to_song_map[bundle_name] = song_item
+
+        # 新增：预计算角色ID到ANOV歌曲的映射以优化性能
+        self.char_id_to_anov_songs = defaultdict(list)
+        for song in self.another_vocal_songs:
+            processed_chars = set()
+            for vocal in song.get('vocals', []):
+                if vocal.get('musicVocalType') == 'another_vocal':
+                    for char in vocal.get('characters', []):
+                        char_id = char.get('characterId')
+                        if char_id and char_id not in processed_chars:
+                            self.char_id_to_anov_songs[char_id].append(song)
+                            processed_chars.add(char_id)
 
         self.available_accompaniment_songs = []
         self.available_piano_songs = []
@@ -1323,10 +1352,22 @@ class GuessSongPlugin(Star):  # type: ignore
         game_data['game_mode'] = 'vocalist' # 标记为猜歌手模式，用于答案判断
 
         def get_vocalist_name(vocal_info):
-            char_ids = [c['characterId'] for c in vocal_info.get('characters', [])]
-            names = [self.character_data.get(str(cid), "未知角色") for cid in char_ids]
-            return " & ".join(names)
+            """[内部函数] 从vocal信息中获取格式化的歌手名。"""
+            char_list = vocal_info.get('characters', [])
+            if not char_list:
+                return "未知"
+            
+            char_names = []
+            for char in char_list:
+                char_id = char.get('characterId')
+                char_data = self.character_data.get(str(char_id))
+                if char_data:
+                    char_names.append(char_data.get("fullName", char_data.get("name", "未知")))
+                else:
+                    char_names.append("未知")
+            return ' + '.join(char_names)
 
+        
         compact_options_text = ""
         for i, vocal in enumerate(another_vocals):
             vocalist_name = get_vocalist_name(vocal)
@@ -2484,6 +2525,180 @@ class GuessSongPlugin(Star):  # type: ignore
         async for result in self._handle_listen_command(event, mode="drums"):
             yield result
 
+    # ... (在 listen_to_drums 方法之后，listen_to_another_vocal 之前，添加这个新函数) ...
+    def _find_song_by_query(self, query: str) -> Optional[Dict]:
+        """通过ID或名称统一查找歌曲，优先精确匹配。"""
+        if query.isdigit():
+            return next((s for s in self.song_data if s['id'] == int(query)), None)
+        else:
+            query_lower = query.lower()
+            found_songs = [s for s in self.song_data if query_lower in s['title'].lower()]
+            if not found_songs:
+                return None
+            
+            exact_match = next((s for s in found_songs if s['title'].lower() == query_lower), None)
+            return exact_match or min(found_songs, key=lambda s: len(s['title']))
+
+    async def _handle_list_anov_versions(self, event: AstrMessageEvent, song: Dict):
+        """[辅助函数] 当用户仅提供歌曲时，列出所有可用的ANOV版本。"""
+        anov_list = [v for v in song.get('vocals', []) if v.get('musicVocalType') == 'another_vocal']
+        if not anov_list:
+            yield event.plain_result(f"......歌曲 '{song['title']}' 没有 Another Vocal 版本。")
+            return
+
+        reply = f"歌曲 \"{song['title']}\" 有以下 Another Vocal 版本:\n"
+        lines = []
+        for v in anov_list:
+            names = [self.character_data.get(str(c['characterId']), {}).get('fullName', '未知') for c in v.get('characters', [])]
+            abbrs = [self.character_data.get(str(c['characterId']), {}).get('name', 'unk') for c in v.get('characters', [])]
+            lines.append(f"  - {' + '.join(names)} ({'+'.join(abbrs)})")
+        reply += "\n".join(lines)
+        reply += f"\n\n请使用 /听anov {song['id']} <角色> 来播放。"
+        yield event.plain_result(reply)
+
+    @filter.command("听anov", alias={"listen_anov", "listen_another_vocal", "anov"})
+    async def listen_to_another_vocal(self, event: AstrMessageEvent):
+        """听指定歌曲的 another vocal 版本。支持多种用法。"""
+        # 1. 通用的前置条件检查
+        if not self._is_group_allowed(event): return
+        session_id = event.unified_msg_origin
+        lock = self.context.game_session_locks.setdefault(session_id, asyncio.Lock())
+        async with lock:
+
+            cooldown = self.config.get("game_cooldown_seconds", 60)
+            if time.time() - self.last_game_end_time.get(session_id, 0) < cooldown:
+                yield event.plain_result(f"嗯......休息 {cooldown - (time.time() - self.last_game_end_time.get(session_id, 0)):.1f} 秒再玩吧......")
+                return
+            if session_id in self.context.active_game_sessions:
+                yield event.plain_result("......有一个正在进行的游戏或播放任务了呢。")
+                return
+
+            user_id = event.get_sender_id()
+            can_listen = await asyncio.get_running_loop().run_in_executor(self.executor, self._can_listen_song_sync, user_id)
+            if not can_listen:
+                limit = self.config.get('daily_listen_limit', 5)
+                yield event.plain_result(f"......你今天听歌的次数已达上限（{limit}次），请明天再来吧......")
+                return
+            
+            if not self.another_vocal_songs:
+                yield event.plain_result("......抱歉，没有找到任何可用的 Another Vocal 歌曲。")
+                return
+            
+            self.context.active_game_sessions.add(session_id)
+
+        try:
+            await asyncio.create_task(self._api_ping("listen_another_vocal"))
+            
+            raw_content = event.message_str.strip().split(maxsplit=1)
+            content = raw_content[1] if len(raw_content) > 1 else ""
+
+            song_to_play, vocal_info = None, None
+
+            # Case 1: `听anov` (无参数)
+            if not content:
+                song_to_play = random.choice(self.another_vocal_songs)
+                anov_list = [v for v in song_to_play.get('vocals', []) if v.get('musicVocalType') == 'another_vocal']
+                if anov_list: vocal_info = random.choice(anov_list)
+            else:
+                parts = content.rsplit(maxsplit=1)
+                last_part = parts[-1].lower()
+                
+                # 尝试将最后一个词解析为角色组合
+                is_char_combo = True
+                target_ids = set()
+                for abbr in last_part.split('+'):
+                    char_id = self.abbr_to_char_id.get(abbr)
+                    if char_id is None:
+                        is_char_combo = False
+                        break
+                    target_ids.add(char_id)
+                
+                # Case 4: `... <歌曲> <角色>`
+                if is_char_combo and len(parts) > 1:
+                    song_query = parts[0]
+                    song_to_play = self._find_song_by_query(song_query)
+                    if not song_to_play:
+                        yield event.plain_result(f"......没有找到歌曲 '{song_query}'。")
+                        return
+                    for v in song_to_play.get('vocals', []):
+                        if v.get('musicVocalType') == 'another_vocal' and {c.get('characterId') for c in v.get('characters', [])} == target_ids:
+                            vocal_info = v
+                            break
+                    if not vocal_info:
+                        yield event.plain_result(f"......歌曲 '{song_to_play['title']}' 没有 '{last_part}' 的 Another Vocal 版本。")
+                        return
+                else:
+                    # Case 2: `... <角色>`
+                    if len(parts) == 1 and is_char_combo and len(target_ids) == 1:
+                        char_id = list(target_ids)[0]
+                        songs_by_char = self.char_id_to_anov_songs.get(char_id)
+                        if not songs_by_char:
+                            char_name = self.character_data.get(str(char_id), {}).get("fullName", content)
+                            yield event.plain_result(f"......抱歉，没有找到 {char_name} 的 Another Vocal 歌曲。")
+                            return
+                        song_to_play = random.choice(songs_by_char)
+                        solo = next((v for v in song_to_play.get('vocals', []) if v.get('musicVocalType') == 'another_vocal' and len(v.get('characters',[])) == 1 and v['characters'][0].get('characterId') == char_id), None)
+                        vocal_info = solo or next((v for v in song_to_play.get('vocals', []) if v.get('musicVocalType') == 'another_vocal' and any(c.get('characterId') == char_id for c in v.get('characters', []))), None)
+                    # Case 3: `... <歌曲>`
+                    else:
+                        song_to_play = self._find_song_by_query(content)
+                        if not song_to_play:
+                            yield event.plain_result(f"......没有找到与 '{content}' 匹配的歌曲或角色。")
+                            return
+                        async for result in self._handle_list_anov_versions(event, song_to_play):
+                            yield result
+                        return
+
+            if not song_to_play or not vocal_info:
+                yield event.plain_result("......内部错误，请联系管理员。")
+                return
+            
+            # 后续流程...
+            char_ids = [c.get('characterId') for c in vocal_info.get('characters', [])]
+            char_id_for_cache = '_'.join(map(str, sorted(char_ids)))
+            output_filename = f"anov_{song_to_play['id']}_{char_id_for_cache}.mp3"
+            output_path = self.output_dir / output_filename
+
+            if not output_path.exists():
+                logger.info(f"缓存文件 {output_filename} 不存在，正在创建...")
+                mp3_source = self._get_resource_path_or_url(f"songs/{vocal_info['vocalAssetbundleName']}/{vocal_info['vocalAssetbundleName']}.mp3")
+                if not mp3_source:
+                    yield event.plain_result("......出错了，找不到有效的音频文件。")
+                    return
+                filler_sec = song_to_play.get('fillerSec', 0)
+                command = ['ffmpeg', '-hide_banner', '-loglevel', 'error', '-ss', str(filler_sec), '-i', str(mp3_source), '-c:a', 'copy', '-f', 'mp3', str(output_path)]
+                proc = await asyncio.create_subprocess_exec(*command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+                _, stderr = await proc.communicate()
+                if proc.returncode != 0:
+                    logger.error(f"FFmpeg failed. Stderr: {stderr.decode(errors='ignore')}")
+                    if output_path.exists(): os.remove(output_path)
+                    yield event.plain_result("......处理音频时出错了（FFmpeg）。")
+                    return
+            else:
+                logger.info(f"使用已缓存的文件: {output_filename}")
+
+            jacket_source = self._get_resource_path_or_url(f"music_jacket/{song_to_play['jacketAssetbundleName']}.png")
+            char_names = [self.character_data.get(str(cid), {}).get('fullName', '未知') for cid in char_ids]
+            
+            msg_chain = [Comp.Plain(f"歌曲:{song_to_play['id']}. {song_to_play['title']} (Another Vocal - {' + '.join(char_names)})\n")]
+            if jacket_source: msg_chain.append(Comp.Image(file=str(jacket_source)))
+            
+            yield event.chain_result(msg_chain)
+            yield event.chain_result([Comp.Record(file=str(output_path))])
+
+            user_id = event.get_sender_id()
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(self.executor, self._record_listen_song, user_id, event.get_sender_name(), session_id)
+            await asyncio.create_task(self._api_log_game({"game_type": 'listen', "game_mode": 'another_vocal', "user_id": user_id, "user_name": event.get_sender_name(), "is_correct": False, "score_awarded": 0, "session_id": session_id}))
+            self.last_game_end_time[session_id] = time.time()
+
+        except Exception as e:
+            logger.error(f"处理听anov功能时出错: {e}", exc_info=True)
+            yield event.plain_result("......播放时出错了，请联系管理员。")
+        finally:
+            if session_id in self.context.active_game_sessions:
+                self.context.active_game_sessions.remove(session_id)
+
     def _get_all_user_stats_sync(self):
         """获取所有用户的统计数据以用于迁移。"""
         with self.get_conn() as conn:
@@ -2943,6 +3158,8 @@ class GuessSongPlugin(Star):  # type: ignore
                 "  `猜歌手` - 竞猜演唱者 (测试功能, 不计分)\n"
                 "  `听<模式> [歌名/ID]` - 播放指定或随机歌曲的特殊音轨。\n"
                 "    可用模式: 钢琴, 伴奏, 人声, 贝斯, 鼓组\n"
+                "  `听anov [歌名/ID] [角色名缩写]` - 播放指定或随机的Another\n"
+                "   Vocal。可指定角色后随机\n"
                 "    (该功能有统一的每日次数限制)\n\n"
                 "📊 数据统计\n"
                 "  `猜歌分数` - 查看自己的猜歌积分和排名\n"
