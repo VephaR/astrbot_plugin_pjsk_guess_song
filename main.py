@@ -1089,6 +1089,7 @@ class GuessSongPlugin(Star):  # type: ignore
             return
             
         game_kwargs = mode_config['kwargs'].copy()
+        game_kwargs['score'] = mode_config.get('score', 1) # 新增此行，将配置中的分数传递下去
 
         # 优化：优先使用预处理模式名作为game_type，否则使用mode_key
         if 'play_preprocessed' in game_kwargs:
