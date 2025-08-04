@@ -12,7 +12,7 @@
 
 本插件的核心音频处理功能（如裁剪、变速、倒放等）依赖于`ffmpeg`。请确保您的系统环境已正确安装 `ffmpeg`。
 
-- **对于 Docker 用户**：官方提供的 `AstrBot` Docker 镜像默认**不包含** `ffmpeg`。您需要手动进入正在运行的容器并执行以下指令进行安装：
+- **对于 Docker 用户**：官方提供的 `AstrBot` Docker 镜像默认**不包含或无法使用** `ffmpeg`。您需要手动进入正在运行的容器并执行以下指令进行安装：
   ```bash
   # 进入容器
   docker exec -it <你的容器名或ID> /bin/bash
