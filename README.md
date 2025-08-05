@@ -53,7 +53,7 @@
   - **示例**:
     - `anov` : 随机播放一首Another Vocal
     - `anov 280 toya` : 播放指定Another Vocal
-    - `anov 280` : 查看播放的Another Vocal
+    - `anov 280` : 查看可播放的Another Vocal版本
     - `anov miku` : 随机播放一首指定角色的Another Vocal
 >所有听歌指令共享每日次数限制。
 
