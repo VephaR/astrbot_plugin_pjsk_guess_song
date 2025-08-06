@@ -12,7 +12,7 @@
 
 本插件的核心音频处理功能（如裁剪、变速、倒放等）依赖于`ffmpeg`。请确保您的系统环境已正确安装 `ffmpeg`。
 
-- **对于 Docker 用户**：官方提供的 `AstrBot` Docker 镜像默认**不包含或无法使用** `ffmpeg`。您需要手动进入正在运行的容器并执行以下指令进行安装：
+- **对于 Docker 用户**：官方提供的 `AstrBot` Docker 镜像**不包含或无法使用** `ffmpeg`。您需要手动进入正在运行的容器并执行以下指令进行安装：
   ```bash
   # 进入容器
   docker exec -it <你的容器名或ID> /bin/bash
@@ -94,7 +94,6 @@
   "lightweight_mode": false,
   "use_local_resources": false,
   "remote_resource_url_base": "https://your.server.com/path/to/pjsk_resources",
-  "stats_server_url": "https://your.server.com",
   "stats_server_api_key": ""
 }
 ```
@@ -112,7 +111,6 @@
 - `lightweight_mode` (布尔值): **轻量模式**。启用后，会禁用“2倍速”、“倒放”等消耗CPU较高的效果，将其自动转为普通模式。
 - `use_local_resources` (布尔值): **是否使用本地资源**。`false`为从远程URL加载，`true`为从插件`resources`目录加载。默认为`false`。
 - `remote_resource_url_base` (字符串): **远程资源URL**。当`use_local_resources`为`false`时，从此URL获取音频等**媒体资源**。
-- `stats_server_url` (字符串): **统计服务器URL**。用于连接后端服务器API的根地址。
 - `stats_server_api_key` (字符串): **统计服务器API密钥**。用于连接后端服务器同步分数、排行榜和统计数据。留空则禁用所有在线功能。[点击前往领取密钥](http://47.110.56.9:5000/register)
 
 
