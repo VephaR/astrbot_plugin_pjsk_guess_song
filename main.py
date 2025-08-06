@@ -1226,7 +1226,7 @@ class GuessSongPlugin(Star):  # type: ignore
         
         # 显示将要应用的效果
         effects_text = "、".join(sorted(effect_names_display))
-        await event.send(event.plain_result(f"......随机模式启动！本轮应用效果：【{effects_text}】(总计{total_score}分)"))
+        await event.send(event.plain_result(f"......本轮应用效果：【{effects_text}】(总计{total_score}分)"))
         
         # --- 后续游戏逻辑 (与原版保持一致) ---
         try:
