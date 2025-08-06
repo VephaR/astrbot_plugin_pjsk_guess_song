@@ -3042,6 +3042,13 @@ class GuessSongPlugin(Star):  # type: ignore
         for source_effect in playable_source_effects:
             for independent_choices in itertools.product(*independent_options):
                 
+
+                # 新增约束：钢琴模式和倒放模式不能同时出现
+                is_piano_mode = 'melody_to_piano' in source_effect.get('kwargs', {})
+                has_reverse_effect = any('reverse_audio' in choice.get('kwargs', {}) for choice in independent_choices)
+                if is_piano_mode and has_reverse_effect:
+                    continue
+                
                 raw_combination = [source_effect] + [choice for choice in independent_choices if choice['score'] > 0]
                 
                 final_effects_list = []
