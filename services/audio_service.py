@@ -570,11 +570,15 @@ class AudioService:
                 section_font = ImageFont.truetype(font_path, 32)
                 body_font = ImageFont.truetype(font_path, 24)
                 id_font = ImageFont.truetype(font_path, 16)
+                # 为特殊行创建一个更大的字体
+                special_font = ImageFont.truetype(font_path, 30)
             except IOError:
                 title_font = ImageFont.load_default(size=48)
                 section_font = ImageFont.load_default(size=32)
                 body_font = ImageFont.load_default(size=24)
                 id_font = ImageFont.load_default(size=16)
+                # 如果主字体加载失败，特殊字体也使用一个较大的默认值
+                special_font = ImageFont.load_default(size=30)
 
             help_text = (
                 "--- PJSK猜歌插件帮助 ---\n\n"
@@ -601,7 +605,8 @@ class AudioService:
                 "  `本地猜歌排行榜` - 查看插件本地存储的猜歌排行榜\n"
                 "  `猜歌排行榜` - 查看服务器猜歌总排行榜 (联网)\n"
                 "  `同步分数` - (管理员)将本地总分同步至服务器\n"
-                "  `查看统计` - 查看各题型的正确率排行"
+                "  `查看统计` - 查看各题型的正确率排行\n\n"
+                "  ♿猜歌效率共跑群♿: 883195991"
             )
             with Pilmoji(img) as pilmoji:
                 center_x, current_y = width // 2, 80
@@ -617,7 +622,15 @@ class AudioService:
                     if not line.strip():
                         current_y += line_height_body // 2
                         continue
-                    if line.startswith("🎵") or line.startswith("🎲") or line.startswith("📊"):
+                    
+                    # 检查是否是特殊行
+                    is_special_line = "♿" in line
+
+                    if is_special_line:
+                        font = special_font
+                        y_increment = line_height_section # 使用稍大的行高
+                        text_to_draw = line.strip()
+                    elif line.startswith("🎵") or line.startswith("🎲") or line.startswith("📊"):
                         font = section_font
                         y_increment = line_height_section
                         text_to_draw = line.strip()
@@ -625,6 +638,7 @@ class AudioService:
                         font = body_font
                         y_increment = line_height_body
                         text_to_draw = line
+
                     pilmoji.text((x_margin, int(current_y)), text_to_draw, font=font, fill=font_color)
                     current_y += y_increment
                 footer_text = f"GuessSong v{self.config.get('PLUGIN_VERSION')} | Generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"

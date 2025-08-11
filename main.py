@@ -62,6 +62,8 @@ class GuessSongPlugin(Star):
         data_dir = StarTools.get_data_dir(PLUGIN_NAME)
         data_dir.mkdir(parents=True, exist_ok=True)
         db_path = data_dir / "guess_song_data.db"
+        self.group_settings_path = self.plugin_dir / "group_settings.json"
+        self.group_settings = self._load_group_settings()
         self.db_service = DBService(str(db_path))
         self.stats_service = StatsService(config)
         self.cache_service = CacheService(self.resources_dir, self.output_dir, self.stats_service, config)
@@ -72,13 +74,13 @@ class GuessSongPlugin(Star):
         self.context.active_game_sessions = getattr(self.context, "active_game_sessions", set())
         self.last_game_end_time = {}
 
-        # 游戏配置 (统一配置项名称)
-        self.game_cooldown_seconds = self.config.get("game_cooldown_seconds", 30)
+        # 游戏配置 (现在将从辅助函数动态获取，不再需要在这里硬编码加载)
+        # self.game_cooldown_seconds = self.config.get("game_cooldown_seconds", 30)
         self.lightweight_mode = self.config.get("lightweight_mode", False)
         self.max_guess_attempts = self.config.get("max_guess_attempts", 10)
         self.answer_timeout = self.config.get("answer_timeout", 30)
-        self.daily_play_limit = self.config.get("daily_play_limit", 15)
-        self.daily_listen_limit = self.config.get("daily_listen_limit", 10)
+        # self.daily_play_limit = self.config.get("daily_play_limit", 15)
+        # self.daily_listen_limit = self.config.get("daily_listen_limit", 10)
         
         self.game_effects = self.audio_service.game_effects
         self.game_modes = self.audio_service.game_modes
@@ -88,6 +90,32 @@ class GuessSongPlugin(Star):
         # 异步初始化任务
         self._init_task = asyncio.create_task(self._async_init())
         self._cleanup_task = asyncio.create_task(self.cache_service.periodic_cleanup_task())
+
+    def _load_group_settings(self) -> Dict:
+        """从 group_settings.json 加载群聊特定设置。"""
+        if not self.group_settings_path.exists():
+            # 文件不存在是正常情况，无需日志
+            return {}
+        try:
+            with open(self.group_settings_path, "r", encoding="utf-8") as f:
+                settings = json.load(f)
+                logger.info(f"成功加载 {len(settings)} 个群聊的特定设置。")
+                return settings
+        except (json.JSONDecodeError, IOError) as e:
+            logger.error(f"加载或解析 group_settings.json 文件失败: {e}")
+            return {}
+
+    def _get_setting_for_group(self, event: AstrMessageEvent, key: str, default: any) -> any:
+        """为当前群聊获取一个分层设置。优先群聊特定设置，然后是全局设置，最后是代码默认值。"""
+        group_id = event.get_group_id()
+        # 1. 尝试从群聊特定设置中获取 (from group_settings.json)
+        if group_id:
+            group_config = self.group_settings.get(str(group_id), {})
+            if key in group_config:
+                return group_config[key]
+        
+        # 2. 如果没有找到，则回退到全局设置 (from main config file)
+        return self.config.get(key, default)
 
     async def _async_init(self):
         """异步初始化所有服务和数据"""
@@ -100,11 +128,12 @@ class GuessSongPlugin(Star):
 
     async def _check_game_start_conditions(self, event: AstrMessageEvent) -> Tuple[bool, Optional[str]]:
         """检查是否可以开始新游戏，返回(布尔值, 提示信息)"""
-        if not self._is_group_allowed(event):
+        if not await self._is_group_allowed(event):
             return False, None
 
         session_id = event.unified_msg_origin
-        cooldown = self.game_cooldown_seconds
+        cooldown = self._get_setting_for_group(event, "game_cooldown_seconds", 30)
+        limit = self._get_setting_for_group(event, "daily_play_limit", 15)
         debug_mode = self.config.get("debug_mode", False)
 
         if not debug_mode and time.time() - self.last_game_end_time.get(session_id, 0) < cooldown:
@@ -115,17 +144,29 @@ class GuessSongPlugin(Star):
         if session_id in self.context.active_game_sessions:
             return False, "......有一个正在进行的游戏了呢。"
 
-        can_play = await self.db_service.can_play(event.get_sender_id(), self.daily_play_limit)
+        can_play = await self.db_service.can_play(event.get_sender_id(), limit)
         if not debug_mode and not can_play:
-            return False, f"......你今天的游戏次数已达上限（{self.daily_play_limit}次），请明天再来吧......"
+            return False, f"......你今天的游戏次数已达上限（{limit}次），请明天再来吧......"
 
         return True, None
     
     async def _is_group_allowed(self, event: AstrMessageEvent) -> bool:
-        """检查群组是否在白名单中"""
+        """检查群组是否在白名单中, 如果不在则发送邀请消息"""
         whitelist = self.config.get("group_whitelist", [])
-        if not whitelist: return True
-        return bool(event.get_group_id() and str(event.get_group_id()) in whitelist)
+        # 如果白名单为空，则允许所有群聊
+        if not whitelist:
+            return True
+
+        is_in_whitelist = bool(event.get_group_id() and str(event.get_group_id()) in whitelist)
+
+        # 如果是群聊、不在白名单中，并且配置了邀请消息，则发送邀请
+        if event.get_group_id() and not is_in_whitelist:
+            try:
+                await event.send(event.plain_result(f'本群未启用猜歌功能，游玩请加入群聊883195991'))
+            except Exception as e:
+                logger.error(f"发送非白名单群聊邀请消息失败: {e}")
+
+        return is_in_whitelist
 
     @filter.command(
         "猜歌",
@@ -519,7 +560,7 @@ class GuessSongPlugin(Star):
     @filter.command("猜歌帮助")
     async def show_guess_song_help(self, event: AstrMessageEvent):
         """以图片形式显示猜歌插件帮助。"""
-        if not self._is_group_allowed(event):
+        if not await self._is_group_allowed(event):
             return
 
         img_path = await self.audio_service.draw_help_image()
@@ -531,7 +572,7 @@ class GuessSongPlugin(Star):
     @filter.command("群猜歌排行榜", alias={"gssrank", "gstop"})
     async def show_ranking(self, event: AstrMessageEvent):
         """显示当前群聊的猜歌排行榜"""
-        if not self._is_group_allowed(event): return
+        if not await self._is_group_allowed(event): return
 
         session_id = event.unified_msg_origin
         rows = await self.db_service.get_group_ranking(session_id)
@@ -549,7 +590,7 @@ class GuessSongPlugin(Star):
     @filter.command("本地猜歌排行榜", alias={"localrank"})
     async def show_local_global_ranking(self, event: AstrMessageEvent):
         """显示本地存储的全局猜歌排行榜"""
-        if not self._is_group_allowed(event): return
+        if not await self._is_group_allowed(event): return
 
         rows = await self.db_service.get_global_ranking_data()
         if not rows:
@@ -668,9 +709,9 @@ class GuessSongPlugin(Star):
             last_play_date = local_global_stats.get('last_play_date', '')
             games_today = daily_plays if last_play_date == today else 0
             
-            # 使用统一的实例变量
-            play_limit = self.daily_play_limit
-            listen_limit = self.daily_listen_limit
+            # 使用新的辅助函数动态获取限制
+            play_limit = self._get_setting_for_group(event, "daily_play_limit", 15)
+            listen_limit = self._get_setting_for_group(event, "daily_listen_limit", 10)
             
             _, listen_today = await self.db_service.get_user_daily_limits(user_id)
             
@@ -728,7 +769,7 @@ class GuessSongPlugin(Star):
     @filter.command("查看统计", alias={"mode_stats", "题型统计"})
     async def show_mode_stats(self, event: AstrMessageEvent):
         """显示各题型的正确率统计（图片排行）"""
-        if not self._is_group_allowed(event): return
+        if not await self._is_group_allowed(event): return
         
         rows = await self.stats_service.get_mode_stats()
         if not rows:
@@ -845,7 +886,7 @@ class GuessSongPlugin(Star):
     
     async def _handle_listen_command(self, event: AstrMessageEvent, mode: str):
         """统一处理所有"听歌"类指令（钢琴、伴奏、人声等）的通用逻辑。"""
-        if not self._is_group_allowed(event): return
+        if not await self._is_group_allowed(event): return
 
         session_id = event.unified_msg_origin
         if session_id not in self.context.game_session_locks:
@@ -853,8 +894,9 @@ class GuessSongPlugin(Star):
         lock = self.context.game_session_locks[session_id]
         
         async with lock:
-            if time.time() - self.last_game_end_time.get(session_id, 0) < self.game_cooldown_seconds:
-                remaining_time = self.game_cooldown_seconds - (time.time() - self.last_game_end_time.get(session_id, 0))
+            cooldown = self._get_setting_for_group(event, "game_cooldown_seconds", 30)
+            if time.time() - self.last_game_end_time.get(session_id, 0) < cooldown:
+                remaining_time = cooldown - (time.time() - self.last_game_end_time.get(session_id, 0))
                 time_display = f"{remaining_time:.3f}" if remaining_time < 1 else str(int(remaining_time))
                 yield event.plain_result(f"嗯......休息 {time_display} 秒再玩吧......")
                 return
@@ -863,10 +905,10 @@ class GuessSongPlugin(Star):
                 return
 
             user_id = event.get_sender_id()
-            can_listen = await self.db_service.can_listen_song(user_id, self.daily_listen_limit)
+            listen_limit = self._get_setting_for_group(event, "daily_listen_limit", 10)
+            can_listen = await self.db_service.can_listen_song(user_id, listen_limit)
             if not can_listen:
-                limit = self.daily_listen_limit
-                yield event.plain_result(f"......你今天听歌的次数已达上限（{limit}次），请明天再来吧......")
+                yield event.plain_result(f"......你今天听歌的次数已达上限（{listen_limit}次），请明天再来吧......")
                 return
             
             config = self.listen_modes[mode]
@@ -953,25 +995,28 @@ class GuessSongPlugin(Star):
     @filter.command("听anov", alias={"listen_anov", "listen_another_vocal", "anov"})
     async def listen_to_another_vocal(self, event: AstrMessageEvent):
         """听指定歌曲的 another vocal 版本。支持多种用法。"""
-        if not self._is_group_allowed(event): return
+        if not await self._is_group_allowed(event): return
         session_id = event.unified_msg_origin
         if session_id not in self.context.game_session_locks:
             self.context.game_session_locks[session_id] = asyncio.Lock()
         lock = self.context.game_session_locks[session_id]
         
         async with lock:
-            if time.time() - self.last_game_end_time.get(session_id, 0) < self.game_cooldown_seconds:
-                yield event.plain_result(f"嗯......休息 {self.game_cooldown_seconds - (time.time() - self.last_game_end_time.get(session_id, 0)):.1f} 秒再玩吧......")
+            cooldown = self._get_setting_for_group(event, "game_cooldown_seconds", 30)
+            if time.time() - self.last_game_end_time.get(session_id, 0) < cooldown:
+                remaining_time = cooldown - (time.time() - self.last_game_end_time.get(session_id, 0))
+                time_display = f"{remaining_time:.3f}" if remaining_time < 1 else str(int(remaining_time))
+                yield event.plain_result(f"嗯......休息 {time_display} 秒再玩吧......")
                 return
             if session_id in self.context.active_game_sessions:
                 yield event.plain_result("......有一个正在进行的游戏或播放任务了呢。")
                 return
 
             user_id = event.get_sender_id()
-            can_listen = await self.db_service.can_listen_song(user_id, self.daily_listen_limit)
+            listen_limit = self._get_setting_for_group(event, "daily_listen_limit", 10)
+            can_listen = await self.db_service.can_listen_song(user_id, listen_limit)
             if not can_listen:
-                limit = self.daily_listen_limit
-                yield event.plain_result(f"......你今天听歌的次数已达上限（{limit}次），请明天再来吧......")
+                yield event.plain_result(f"......你今天听歌的次数已达上限（{listen_limit}次），请明天再来吧......")
                 return
             
             if not self.cache_service.another_vocal_songs:
