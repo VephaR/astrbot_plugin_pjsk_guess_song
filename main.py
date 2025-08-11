@@ -162,7 +162,7 @@ class GuessSongPlugin(Star):
         # 如果是群聊、不在白名单中，并且配置了邀请消息，则发送邀请
         if event.get_group_id() and not is_in_whitelist:
             try:
-                await event.send(event.plain_result(f'本群未启用猜歌功能，游玩请加入群聊883195991'))
+                await event.send(event.plain_result(f"本群未启用猜歌功能"))
             except Exception as e:
                 logger.error(f"发送非白名单群聊邀请消息失败: {e}")
 

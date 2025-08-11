@@ -606,7 +606,6 @@ class AudioService:
                 "  `猜歌排行榜` - 查看服务器猜歌总排行榜 (联网)\n"
                 "  `同步分数` - (管理员)将本地总分同步至服务器\n"
                 "  `查看统计` - 查看各题型的正确率排行\n\n"
-                "  ♿猜歌效率共跑群♿: 883195991"
             )
             with Pilmoji(img) as pilmoji:
                 center_x, current_y = width // 2, 80
