@@ -361,6 +361,9 @@ class GuessSongPlugin(Star):
                 return
         except Exception as e:
             logger.error(f"发送消息失败: {e}. 游戏中断。", exc_info=True)
+            if session_id in self.context.active_game_sessions:
+                self.context.active_game_sessions.remove(session_id)
+            self.last_game_end_time[session_id] = time.time()
             return
         finally:
             if debug_mode:
