@@ -113,4 +113,41 @@
 - `remote_resource_url_base` (字符串): **远程资源URL**。当`use_local_resources`为`false`时，从此URL获取音频等**媒体资源**。
 - `stats_server_api_key` (字符串): **统计服务器API密钥**。用于连接后端服务器同步分数、排行榜和统计数据。留空则禁用所有在线功能。[点击前往领取密钥](http://47.110.56.9:5000/register)
 
+## 4.1 群聊特定配置
+
+除了通过WebUI进行全局配置外，本插件还支持为特定的群聊设置独立的配置，以满足不同群组的需求。这通过在插件根目录（`data/plugins/astrbot_plugin_pjsk_guess_song/`）下创建一个名为 `group_settings.json` 的文件来实现。
+
+如果该文件不存在，插件会使用全局配置。如果文件存在，插件会加载它，并对文件中指定的群聊应用特定设置。
+
+**文件格式示例:**
+
+```json
+{
+    "123123": {
+      "daily_play_limit": 50,
+      "game_cooldown_seconds": 5,
+      "daily_listen_limit": 50
+    },
+    "12312342": {
+      "daily_play_limit": 50,
+      "game_cooldown_seconds": 100
+    }
+}
+```
+
+**说明:**
+- 文件的最外层是一个JSON对象。
+- 对象的键（Key）是**群号**（必须是字符串格式）。
+- 键对应的值（Value）是另一个JSON对象，包含了要为该群聊覆盖的配置项。
+- 如果某个群聊在此文件中被配置，那么该群聊的相应设置将**优先于**WebUI中的全局设置。未在文件中指定的设置项仍会使用全局配置。
+
+**可单独配置的选项:**
+- `daily_play_limit`: 每日猜歌游戏次数。
+- `daily_listen_limit`: 每日听歌次数。
+- `game_cooldown_seconds`: 游戏冷却时间（秒）。
+- `answer_timeout`: 游戏回答的超时时间（秒）。
+- `max_guess_attempts`: 每轮游戏总计可尝试回答的次数。
+- `bonus_time_after_first_answer`: 首位答对后，他人可继续得分的奖励时间（秒）。
+- `end_game_after_bonus_time`: 是否在奖励时间结束后立即结束游戏。
+
 

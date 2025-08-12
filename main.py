@@ -77,8 +77,8 @@ class GuessSongPlugin(Star):
         # 游戏配置 (现在将从辅助函数动态获取，不再需要在这里硬编码加载)
         # self.game_cooldown_seconds = self.config.get("game_cooldown_seconds", 30)
         self.lightweight_mode = self.config.get("lightweight_mode", False)
-        self.max_guess_attempts = self.config.get("max_guess_attempts", 10)
-        self.answer_timeout = self.config.get("answer_timeout", 30)
+        # self.max_guess_attempts = self.config.get("max_guess_attempts", 10)
+        # self.answer_timeout = self.config.get("answer_timeout", 30)
         # self.daily_play_limit = self.config.get("daily_play_limit", 15)
         # self.daily_listen_limit = self.config.get("daily_listen_limit", 10)
         
@@ -251,7 +251,8 @@ class GuessSongPlugin(Star):
         
         options_img_path = await self.audio_service.create_options_image(options)
         
-        intro_text = f".......嗯\n这首歌是？请在{self.answer_timeout}秒内发送编号回答。\n"
+        answer_timeout = self._get_setting_for_group(event, "answer_timeout", 30)
+        intro_text = f".......嗯\n这首歌是？请在{answer_timeout}秒内发送编号回答。\n"
         intro_messages = [Comp.Plain(intro_text)]
         if options_img_path:
             intro_messages.append(Comp.Image(file=options_img_path))
@@ -322,7 +323,7 @@ class GuessSongPlugin(Star):
         logger.info(f"[猜歌插件] 新游戏开始. 答案: {correct_song['title']} (选项 {game_data['correct_answer_num']})")
         
         options_img_path = await self.audio_service.create_options_image(options)
-        timeout_seconds = self.config.get("answer_timeout", 30)
+        timeout_seconds = self._get_setting_for_group(event, "answer_timeout", 30)
         intro_text = f".......嗯\n这首歌是？请在{timeout_seconds}秒内发送编号回答。\n"
         
         intro_messages = [Comp.Plain(intro_text)]
@@ -342,13 +343,13 @@ class GuessSongPlugin(Star):
         """统一的游戏会话执行器，包含简化的统计逻辑。"""
         session_id = event.unified_msg_origin
         debug_mode = self.config.get("debug_mode", False)
-        timeout_seconds = self.config.get("answer_timeout", 30)
+        timeout_seconds = self._get_setting_for_group(event, "answer_timeout", 30)
         correct_players = {}
         first_correct_answer_time = 0
         game_ended_by_attempts = False
         guessed_users = set()
         guess_attempts_count = 0
-        max_guess_attempts = self.config.get("max_guess_attempts", 10)
+        max_guess_attempts = self._get_setting_for_group(event, "max_guess_attempts", 10)
         game_results_to_log = []
 
         try:
@@ -400,7 +401,7 @@ class GuessSongPlugin(Star):
             score_to_add = 0
             can_score = False
             if is_correct:
-                bonus_time = self.config.get("bonus_time_after_first_answer", 5)
+                bonus_time = self._get_setting_for_group(event, "bonus_time_after_first_answer", 5)
                 is_first_correct_answer = (first_correct_answer_time == 0)
                 can_score = is_first_correct_answer or (bonus_time > 0 and (time.time() - first_correct_answer_time) <= bonus_time)
                 if can_score:
@@ -428,7 +429,7 @@ class GuessSongPlugin(Star):
                     correct_players[user_id] = {'name': user_name}
                     if first_correct_answer_time == 0:
                         first_correct_answer_time = time.time()
-                        end_game_early = self.config.get("end_game_after_bonus_time", True)
+                        end_game_early = self._get_setting_for_group(event, "end_game_after_bonus_time", True)
                         if end_game_early and bonus_time > 0:
                             asyncio.create_task(
                                 asyncio.sleep(bonus_time),
@@ -544,7 +545,7 @@ class GuessSongPlugin(Star):
             vocalist_name = get_vocalist_name(vocal)
             compact_options_text += f"{i + 1}. {vocalist_name}\n"
         
-        timeout_seconds = self.answer_timeout
+        timeout_seconds = self._get_setting_for_group(event, "answer_timeout", 30)
         intro_text = f"这首歌是【{song['title']}】，正在演唱的是谁？[1.5倍速]\n请在{timeout_seconds}秒内发送编号回答。\n\n⚠️ 测试功能，不计分\n\n{compact_options_text}"
         jacket_source = self.cache_service.get_resource_path_or_url(f"music_jacket/{song['jacketAssetbundleName']}.png")
         
