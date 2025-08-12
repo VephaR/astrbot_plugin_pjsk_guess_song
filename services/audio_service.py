@@ -34,11 +34,12 @@ from astrbot.api import AstrBotConfig
 from .cache_service import CacheService
 
 class AudioService:
-    def __init__(self, cache_service: CacheService, resources_dir: Path, output_dir: Path, config: AstrBotConfig):
+    def __init__(self, cache_service: CacheService, resources_dir: Path, output_dir: Path, config: AstrBotConfig, plugin_version: str):
         self.cache_service = cache_service
         self.resources_dir = resources_dir
         self.output_dir = output_dir
         self.config = config
+        self.plugin_version = plugin_version
         self.executor = ThreadPoolExecutor(max_workers=5)
         self._session: Optional[aiohttp.ClientSession] = None
         
@@ -442,7 +443,7 @@ class AudioService:
                         draw = ImageDraw.Draw(img)
                         draw.line([(30, current_y + 60), (width - 30, current_y + 60)], fill=(200, 200, 210, 128), width=1)
                     current_y += 70
-                footer_text = f"GuessSong v{self.config.get('PLUGIN_VERSION')} | Generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                footer_text = f"GuessSong v{self.plugin_version} | Generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
                 pilmoji.text((center_x, height - 25), footer_text, font=id_font, fill=header_color, anchor="ms")
             img_path = self.output_dir / f"song_ranking_{int(time.time())}.png"
             img.save(img_path)
@@ -524,7 +525,7 @@ class AudioService:
                         draw = ImageDraw.Draw(img)
                         draw.line([(40, current_y + row_height - 8), (width - 40, current_y + row_height - 8)], fill=(200, 200, 210, 128), width=1)
                     current_y += row_height
-                footer_text = f"GuessSong v{self.config.get('PLUGIN_VERSION')} | Generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                footer_text = f"GuessSong v{self.plugin_version} | Generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
                 pilmoji.text((center_x, height - 40), footer_text, font=body_font, fill=header_color, anchor="ms")
             img_path = self.output_dir / f"mode_stats_{int(time.time())}.png"
             img.save(img_path)
@@ -640,7 +641,7 @@ class AudioService:
 
                     pilmoji.text((x_margin, int(current_y)), text_to_draw, font=font, fill=font_color)
                     current_y += y_increment
-                footer_text = f"GuessSong v{self.config.get('PLUGIN_VERSION')} | Generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                footer_text = f"GuessSong v{self.plugin_version} | Generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
                 pilmoji.text((int(center_x), height - 40), footer_text, font=id_font, fill=header_color, anchor="ms")
             img_path = self.output_dir / f"guess_song_help_{int(time.time())}.png"
             img.save(img_path)

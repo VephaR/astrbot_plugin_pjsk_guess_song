@@ -67,7 +67,7 @@ class GuessSongPlugin(Star):
         self.db_service = DBService(str(db_path))
         self.stats_service = StatsService(config)
         self.cache_service = CacheService(self.resources_dir, self.output_dir, self.stats_service, config)
-        self.audio_service = AudioService(self.cache_service, self.resources_dir, self.output_dir, config)
+        self.audio_service = AudioService(self.cache_service, self.resources_dir, self.output_dir, config, PLUGIN_VERSION)
 
         # 游戏状态管理
         self.context.game_session_locks = getattr(self.context, "game_session_locks", {})
