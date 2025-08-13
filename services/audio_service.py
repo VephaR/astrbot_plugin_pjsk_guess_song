@@ -597,9 +597,8 @@ class AudioService:
                 "  `猜歌手` - 竞猜演唱者 (测试功能, 不计分)\n"
                 "  `听<模式> [歌名/ID]` - 播放指定或随机歌曲的特殊音轨。\n"
                 "    可用模式: 钢琴, 伴奏, 人声, 贝斯, 鼓组\n"
-                "  `听anov [歌名/ID] [角色名缩写]` - 放在指定的另一个\n"
-                "    声音。你可以选择一个角色来随机播放\n"
-                "    (该功能有统一的每日次数限制)\n\n"
+                "  `听anvo [歌名/ID] [角色名缩写]` - 播放指定或随机的 Another Vocal，你可以选择一个角色来随机播放。\n"
+                "    (所有听歌指令共享每日次数限制)\n\n"
                 "📊 数据统计\n"
                 "  `猜歌分数` - 查看自己的猜歌积分和排名\n"
                 "  `群猜歌排行榜` - 查看本群猜歌排行榜\n"
@@ -805,8 +804,8 @@ class AudioService:
 
         return song_to_play, mp3_source
 
-    async def get_anov_song_and_vocal(self, content: str, another_vocal_songs: List[Dict], char_id_to_anov_songs: Dict, abbr_to_char_id: Dict) -> Tuple[Optional[Dict], Optional[Dict]]:
-        """根据用户输入解析并返回anoVocal歌曲和版本。"""
+    async def get_anvo_song_and_vocal(self, content: str, another_vocal_songs: List[Dict], char_id_to_anov_songs: Dict, abbr_to_char_id: Dict) -> Tuple[Optional[Dict], Optional[Dict]]:
+        """根据用户输入解析并返回Another Vocal歌曲和版本。"""
         song_to_play, vocal_info = None, None
 
         if not content:
@@ -849,21 +848,21 @@ class AudioService:
         
         return song_to_play, vocal_info
 
-    async def process_anov_audio(self, song: Dict, vocal_info: Dict) -> Optional[str]:
-        """处理ANOV音频，优先使用缓存文件。"""
+    async def process_anvo_audio(self, song: Dict, vocal_info: Dict) -> Optional[str]:
+        """处理ANVO音频，优先使用缓存文件。"""
         char_ids = [c.get('characterId') for c in vocal_info.get('characters', [])]
         char_id_for_cache = '_'.join(map(str, sorted(char_ids)))
-        output_filename = f"anov_{song['id']}_{char_id_for_cache}.mp3"
+        output_filename = f"anvo_{song['id']}_{char_id_for_cache}.mp3"
         output_path = self.output_dir / output_filename
 
         if output_path.exists():
-            logger.info(f"使用已缓存的ANOV文件: {output_filename}")
+            logger.info(f"使用已缓存的ANVO文件: {output_filename}")
             return str(output_path)
         
         logger.info(f"缓存文件 {output_filename} 不存在，正在创建...")
         mp3_source = self.cache_service.get_resource_path_or_url(f"songs/{vocal_info['vocalAssetbundleName']}/{vocal_info['vocalAssetbundleName']}.mp3")
         if not mp3_source:
-            logger.error("找不到有效的ANOV音频文件。")
+            logger.error("找不到有效的ANVO音频文件。")
             return None
             
         filler_sec = song.get('fillerSec', 0)

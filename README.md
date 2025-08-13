@@ -48,13 +48,13 @@
     - `听贝斯 Tell Your World`: 播放指定歌曲的贝斯音轨。
     - `听鼓组 3`: 播放ID为3的歌曲的鼓组音轨。
 >注：所有音轨均为使用Demucs分离
-- `听anov [歌名/ID] [角色名缩写]` : 播放指定或随机的Another Vocal。可指定角色后随机
+- `听anvo [歌名/ID] [角色名缩写]` : 播放指定或随机的Another Vocal。可指定角色后随机
   - **注意**: 按歌曲名搜索时，需要提供完整的官方名称，暂不支持别名或模糊匹配。若查找困难，建议先使用其他查歌机器人获取准确的歌曲名或ID。
   - **示例**:
-    - `anov` : 随机播放一首Another Vocal
-    - `anov 280 toya` : 播放指定Another Vocal
-    - `anov 280` : 查看可播放的Another Vocal版本
-    - `anov miku` : 随机播放一首指定角色的Another Vocal
+    - `anvo` : 随机播放一首Another Vocal
+    - `anvo 280 toya` : 播放指定Another Vocal
+    - `anvo 280` : 查看可播放的Another Vocal版本
+    - `anvo miku` : 随机播放一首指定角色的Another Vocal
 >所有听歌指令共享每日次数限制。
 
 ### 数据与帮助

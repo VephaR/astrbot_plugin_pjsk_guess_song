@@ -996,7 +996,7 @@ class GuessSongPlugin(Star):
         async for result in self._handle_listen_command(event, mode="drums"):
             yield result
 
-    @filter.command("听anov", alias={"listen_anov", "listen_another_vocal", "anov"})
+    @filter.command("听anvo", alias={"anvo", "listen_anvo", "listen_another_vocal", "anov", "listen_anov", "听anov"})
     async def listen_to_another_vocal(self, event: AstrMessageEvent):
         """听指定歌曲的 another vocal 版本。支持多种用法。"""
         if not await self._is_group_allowed(event): return
@@ -1036,7 +1036,7 @@ class GuessSongPlugin(Star):
             content = raw_content[1] if len(raw_content) > 1 else ""
 
             # 这个调用现在是正确的了
-            song_to_play, vocal_info = await self.audio_service.get_anov_song_and_vocal(content, self.cache_service.another_vocal_songs, self.cache_service.char_id_to_anov_songs, self.cache_service.abbr_to_char_id)
+            song_to_play, vocal_info = await self.audio_service.get_anvo_song_and_vocal(content, self.cache_service.another_vocal_songs, self.cache_service.char_id_to_anov_songs, self.cache_service.abbr_to_char_id)
             
             if not song_to_play:
                 if content:
@@ -1060,11 +1060,11 @@ class GuessSongPlugin(Star):
                     abbrs = [self.cache_service.character_data.get(str(c['characterId']), {}).get('name', 'unk') for c in v.get('characters', [])]
                     lines.append(f"  - {' + '.join(names)} ({'+'.join(abbrs)})")
                 reply += "\n".join(lines)
-                reply += f"\n\n请使用 /听anov {song_to_play['id']} <角色> 来播放。"
+                reply += f"\n\n请使用 /听anvo {song_to_play['id']} <角色> 来播放。"
                 yield event.plain_result(reply)
                 return
 
-            mp3_source = await self.audio_service.process_anov_audio(song_to_play, vocal_info)
+            mp3_source = await self.audio_service.process_anvo_audio(song_to_play, vocal_info)
 
             if not mp3_source:
                 yield event.plain_result("......处理音频时出错了（FFmpeg）。")
@@ -1088,7 +1088,7 @@ class GuessSongPlugin(Star):
             self.last_game_end_time[session_id] = time.time()
         
         except Exception as e:
-            logger.error(f"处理听anov功能时出错: {e}", exc_info=True)
+            logger.error(f"处理听anvo功能时出错: {e}", exc_info=True)
             yield event.plain_result("......播放时出错了，请联系管理员。")
         finally:
             if session_id in self.context.active_game_sessions:
