@@ -149,5 +149,9 @@
 - `max_guess_attempts`: 每轮游戏总计可尝试回答的次数。
 - `bonus_time_after_first_answer`: 首位答对后，他人可继续得分的奖励时间（秒）。
 - `end_game_after_bonus_time`: 是否在奖励时间结束后立即结束游戏。
+## 5. 一些更新说明
+
+建议拉取最新的修改或者至少进行以下修改，否则在一些有发言频率限制的群聊发送失败时，会造成锁无法释放，重启机器人才能继续进行游戏。
+- **Commit:** [`94571a9`](https://github.com/nichinichisou0609/astrbot_plugin_pjsk_guess_song/commit/94571a9bc2213e7151ec5ce79c374764f6c77656) - fix(session): Ensure game session is properly cleaned up on send failure
 
 
