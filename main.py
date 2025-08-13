@@ -719,10 +719,12 @@ class GuessSongPlugin(Star):
             
             _, listen_today = await self.db_service.get_user_daily_limits(user_id)
             
+            remaining_plays = max(0, play_limit - games_today)
+            remaining_listens = max(0, listen_limit - listen_today)
             result_parts.append(
                 f"🕒 剩余次数\n"
-                f"  - 猜歌: {play_limit - games_today}/{play_limit}\n"
-                f"  - 听歌: {listen_limit - listen_today}/{listen_limit}"
+                f"  - 猜歌: {remaining_plays}/{play_limit}\n"
+                f"  - 听歌: {remaining_listens}/{listen_limit}"
             )
 
         await event.send(event.plain_result("\n\n".join(result_parts)))
