@@ -199,72 +199,74 @@ class GuessSongPlugin(Star):
                 return
             self.context.active_game_sessions.add(session_id)
 
-        initiator_id = event.get_sender_id()
-        initiator_name = event.get_sender_name()
-        await self.db_service.consume_daily_play_attempt(initiator_id, initiator_name)
-        await self.stats_service.api_ping("guess_song")
-        
-        mode_config = self.game_modes.get(mode_key)
-        if not mode_config:
-            await event.send(event.plain_result(f"......未知的猜歌模式 '{mode_key}'。"))
-            if session_id in self.context.active_game_sessions:
-                self.context.active_game_sessions.remove(session_id)
-            return
-        
-        game_kwargs = mode_config['kwargs'].copy()
-        game_kwargs['score'] = mode_config.get('score', 1)
-
-        if 'play_preprocessed' in game_kwargs:
-            game_type_suffix = game_kwargs['play_preprocessed']
-        elif 'melody_to_piano' in game_kwargs:
-            game_type_suffix = 'piano'
-        elif 'reverse_audio' in game_kwargs:
-            game_type_suffix = 'reverse'
-        elif 'speed_multiplier' in game_kwargs:
-            game_type_suffix = 'speed_2x'
-        else:
-            game_type_suffix = 'normal'
-        game_kwargs['game_type'] = f"guess_song_{game_type_suffix}"
-        
-        game_data = await self.audio_service.get_game_clip(**game_kwargs)
-        if not game_data:
-            await event.send(event.plain_result("......开始游戏失败，可能是缺少资源文件或配置错误。"))
-            if session_id in self.context.active_game_sessions:
-                self.context.active_game_sessions.remove(session_id)
-            return
+        try:
+            initiator_id = event.get_sender_id()
+            initiator_name = event.get_sender_name()
+            await self.db_service.consume_daily_play_attempt(initiator_id, initiator_name)
+            await self.stats_service.api_ping("guess_song")
             
-        correct_song = game_data['song']
-        if not self.song_data:
-            await event.send(event.plain_result("......歌曲数据未加载，无法生成选项。"))
+            mode_config = self.game_modes.get(mode_key)
+            if not mode_config:
+                await event.send(event.plain_result(f"......未知的猜歌模式 '{mode_key}'。"))
+                return
+            
+            game_kwargs = mode_config['kwargs'].copy()
+            game_kwargs['score'] = mode_config.get('score', 1)
+
+            if 'play_preprocessed' in game_kwargs:
+                game_type_suffix = game_kwargs['play_preprocessed']
+            elif 'melody_to_piano' in game_kwargs:
+                game_type_suffix = 'piano'
+            elif 'reverse_audio' in game_kwargs:
+                game_type_suffix = 'reverse'
+            elif 'speed_multiplier' in game_kwargs:
+                game_type_suffix = 'speed_2x'
+            else:
+                game_type_suffix = 'normal'
+            game_kwargs['game_type'] = f"guess_song_{game_type_suffix}"
+            
+            game_data = await self.audio_service.get_game_clip(**game_kwargs)
+            if not game_data:
+                await event.send(event.plain_result("......开始游戏失败，可能是缺少资源文件或配置错误。"))
+                return
+                
+            correct_song = game_data['song']
+            if not self.song_data:
+                await event.send(event.plain_result("......歌曲数据未加载，无法生成选项。"))
+                return
+
+            other_songs = random.sample([s for s in self.song_data if s['id'] != correct_song['id']], 11)
+            options = [correct_song] + other_songs
+            random.shuffle(options)
+            
+            game_data['options'] = options
+            game_data['correct_answer_num'] = options.index(correct_song) + 1
+            
+            logger.info(f"[猜歌插件] 新游戏开始. 答案: {correct_song['title']} (选项 {game_data['correct_answer_num']})")
+            
+            options_img_path = await self.audio_service.create_options_image(options)
+            
+            answer_timeout = self._get_setting_for_group(event, "answer_timeout", 30)
+            intro_text = f".......嗯\n这首歌是？请在{answer_timeout}秒内发送编号回答。\n"
+            intro_messages = [Comp.Plain(intro_text)]
+            if options_img_path:
+                intro_messages.append(Comp.Image(file=options_img_path))
+            
+            jacket_source = self.cache_service.get_resource_path_or_url(f"music_jacket/{correct_song['jacketAssetbundleName']}.png")
+            answer_reveal_messages = [
+                Comp.Plain(f"正确答案是: {game_data['correct_answer_num']}. {correct_song['title']}\n"),
+            ]
+            if jacket_source:
+                answer_reveal_messages.append(Comp.Image(file=str(jacket_source)))
+            
+            await self._run_game_session(event, game_data, intro_messages, answer_reveal_messages)
+        except Exception as e:
+            logger.error(f"游戏启动过程中发生未处理的异常: {e}", exc_info=True)
+            await event.send(event.plain_result("......开始游戏时发生内部错误，已中断。"))
+        finally:
             if session_id in self.context.active_game_sessions:
                 self.context.active_game_sessions.remove(session_id)
-            return
-
-        other_songs = random.sample([s for s in self.song_data if s['id'] != correct_song['id']], 11)
-        options = [correct_song] + other_songs
-        random.shuffle(options)
-        
-        game_data['options'] = options
-        game_data['correct_answer_num'] = options.index(correct_song) + 1
-        
-        logger.info(f"[猜歌插件] 新游戏开始. 答案: {correct_song['title']} (选项 {game_data['correct_answer_num']})")
-        
-        options_img_path = await self.audio_service.create_options_image(options)
-        
-        answer_timeout = self._get_setting_for_group(event, "answer_timeout", 30)
-        intro_text = f".......嗯\n这首歌是？请在{answer_timeout}秒内发送编号回答。\n"
-        intro_messages = [Comp.Plain(intro_text)]
-        if options_img_path:
-            intro_messages.append(Comp.Image(file=options_img_path))
-        
-        jacket_source = self.cache_service.get_resource_path_or_url(f"music_jacket/{correct_song['jacketAssetbundleName']}.png")
-        answer_reveal_messages = [
-            Comp.Plain(f"正确答案是: {game_data['correct_answer_num']}. {correct_song['title']}\n"),
-        ]
-        if jacket_source:
-            answer_reveal_messages.append(Comp.Image(file=str(jacket_source)))
-        
-        await self._run_game_session(event, game_data, intro_messages, answer_reveal_messages)
+            self.last_game_end_time[session_id] = time.time()
 
     @filter.command("随机猜歌", alias={"rgs"})
     async def start_random_guess_song(self, event: AstrMessageEvent):
@@ -282,62 +284,64 @@ class GuessSongPlugin(Star):
                 return
             self.context.active_game_sessions.add(session_id)
 
-        initiator_id = event.get_sender_id()
-        initiator_name = event.get_sender_name()
-        await self.db_service.consume_daily_play_attempt(initiator_id, initiator_name)
-        await self.stats_service.api_ping("guess_song_random")
+        try:
+            initiator_id = event.get_sender_id()
+            initiator_name = event.get_sender_name()
+            await self.db_service.consume_daily_play_attempt(initiator_id, initiator_name)
+            await self.stats_service.api_ping("guess_song_random")
 
-        combined_kwargs, total_score, effect_names_display, mode_name_str = self.audio_service.get_random_mode_config()
-        if not combined_kwargs:
-            await event.send(event.plain_result("......随机模式启动失败，没有可用的效果组合。请检查资源文件。"))
-            if session_id in self.context.active_game_sessions:
-                self.context.active_game_sessions.remove(session_id)
-            return
+            combined_kwargs, total_score, effect_names_display, mode_name_str = self.audio_service.get_random_mode_config()
+            if not combined_kwargs:
+                await event.send(event.plain_result("......随机模式启动失败，没有可用的效果组合。请检查资源文件。"))
+                return
 
-        await event.send(event.plain_result(f"......本轮应用效果：【{effect_names_display}】(总计{total_score}分)"))
-        combined_kwargs['random_mode_name'] = f"random_{mode_name_str}"
-        combined_kwargs['score'] = total_score
-        combined_kwargs['game_type'] = 'guess_song_random'
-        
-        game_data = await self.audio_service.get_game_clip(**combined_kwargs)
-        if not game_data:
-            await event.send(event.plain_result("......开始游戏失败，可能是缺少资源文件或配置错误。"))
-            if session_id in self.context.active_game_sessions:
-                self.context.active_game_sessions.remove(session_id)
-            return
-
-        correct_song = game_data['song']
-        if not self.song_data:
-            await event.send(event.plain_result("......歌曲数据未加载，无法生成选项。"))
-            if session_id in self.context.active_game_sessions:
-                self.context.active_game_sessions.remove(session_id)
-            return
+            await event.send(event.plain_result(f"......本轮应用效果：【{effect_names_display}】(总计{total_score}分)"))
+            combined_kwargs['random_mode_name'] = f"random_{mode_name_str}"
+            combined_kwargs['score'] = total_score
+            combined_kwargs['game_type'] = 'guess_song_random'
             
-        other_songs = random.sample([s for s in self.song_data if s['id'] != correct_song['id']], 11)
-        options = [correct_song] + other_songs
-        random.shuffle(options)
-        
-        game_data['options'] = options
-        game_data['correct_answer_num'] = options.index(correct_song) + 1
-        
-        logger.info(f"[猜歌插件] 新游戏开始. 答案: {correct_song['title']} (选项 {game_data['correct_answer_num']})")
-        
-        options_img_path = await self.audio_service.create_options_image(options)
-        timeout_seconds = self._get_setting_for_group(event, "answer_timeout", 30)
-        intro_text = f".......嗯\n这首歌是？请在{timeout_seconds}秒内发送编号回答。\n"
-        
-        intro_messages = [Comp.Plain(intro_text)]
-        if options_img_path:
-            intro_messages.append(Comp.Image(file=options_img_path))
-        
-        jacket_source = self.cache_service.get_resource_path_or_url(f"music_jacket/{correct_song['jacketAssetbundleName']}.png")
-        answer_reveal_messages = [
-            Comp.Plain(f"正确答案是: {game_data['correct_answer_num']}. {correct_song['title']}\n"),
-        ]
-        if jacket_source:
-            answer_reveal_messages.append(Comp.Image(file=str(jacket_source)))
-        
-        await self._run_game_session(event, game_data, intro_messages, answer_reveal_messages)
+            game_data = await self.audio_service.get_game_clip(**combined_kwargs)
+            if not game_data:
+                await event.send(event.plain_result("......开始游戏失败，可能是缺少资源文件或配置错误。"))
+                return
+
+            correct_song = game_data['song']
+            if not self.song_data:
+                await event.send(event.plain_result("......歌曲数据未加载，无法生成选项。"))
+                return
+                
+            other_songs = random.sample([s for s in self.song_data if s['id'] != correct_song['id']], 11)
+            options = [correct_song] + other_songs
+            random.shuffle(options)
+            
+            game_data['options'] = options
+            game_data['correct_answer_num'] = options.index(correct_song) + 1
+            
+            logger.info(f"[猜歌插件] 新游戏开始. 答案: {correct_song['title']} (选项 {game_data['correct_answer_num']})")
+            
+            options_img_path = await self.audio_service.create_options_image(options)
+            timeout_seconds = self._get_setting_for_group(event, "answer_timeout", 30)
+            intro_text = f".......嗯\n这首歌是？请在{timeout_seconds}秒内发送编号回答。\n"
+            
+            intro_messages = [Comp.Plain(intro_text)]
+            if options_img_path:
+                intro_messages.append(Comp.Image(file=options_img_path))
+            
+            jacket_source = self.cache_service.get_resource_path_or_url(f"music_jacket/{correct_song['jacketAssetbundleName']}.png")
+            answer_reveal_messages = [
+                Comp.Plain(f"正确答案是: {game_data['correct_answer_num']}. {correct_song['title']}\n"),
+            ]
+            if jacket_source:
+                answer_reveal_messages.append(Comp.Image(file=str(jacket_source)))
+            
+            await self._run_game_session(event, game_data, intro_messages, answer_reveal_messages)
+        except Exception as e:
+            logger.error(f"游戏启动过程中发生未处理的异常: {e}", exc_info=True)
+            await event.send(event.plain_result("......开始游戏时发生内部错误，已中断。"))
+        finally:
+            if session_id in self.context.active_game_sessions:
+                self.context.active_game_sessions.remove(session_id)
+            self.last_game_end_time[session_id] = time.time()
 
     async def _run_game_session(self, event: AstrMessageEvent, game_data: Dict, intro_messages: List, answer_reveal_messages: List):
         """统一的游戏会话执行器，包含简化的统计逻辑。"""
@@ -486,79 +490,83 @@ class GuessSongPlugin(Star):
                 return
             self.context.active_game_sessions.add(session_id)
 
-        initiator_id = event.get_sender_id()
-        initiator_name = event.get_sender_name()
-        await self.db_service.consume_daily_play_attempt(initiator_id, initiator_name)
-        await self.stats_service.api_ping("guess_song_vocalist")
-        
-        debug_mode = self.config.get("debug_mode", False)
-        
-        song = random.choice(self.cache_service.another_vocal_songs)
-        all_vocals = song.get('vocals', [])
-        another_vocals = [v for v in all_vocals if v.get('musicVocalType') == 'another_vocal']
-        
-        if not another_vocals:
-            await event.send(event.plain_result("......没有找到合适的歌曲版本，游戏无法开始。"))
+        try:
+            initiator_id = event.get_sender_id()
+            initiator_name = event.get_sender_name()
+            await self.db_service.consume_daily_play_attempt(initiator_id, initiator_name)
+            await self.stats_service.api_ping("guess_song_vocalist")
+            
+            debug_mode = self.config.get("debug_mode", False)
+            
+            song = random.choice(self.cache_service.another_vocal_songs)
+            all_vocals = song.get('vocals', [])
+            another_vocals = [v for v in all_vocals if v.get('musicVocalType') == 'another_vocal']
+            
+            if not another_vocals:
+                await event.send(event.plain_result("......没有找到合适的歌曲版本，游戏无法开始。"))
+                return
+                
+            correct_vocal_version = random.choice(another_vocals)
+            
+            game_data = await self.audio_service.get_game_clip(
+                force_song_object=song,
+                force_vocal_version=correct_vocal_version,
+                speed_multiplier=1.5,
+                game_type='guess_song_vocalist',
+                guess_type='vocalist',
+                mode_name='猜歌手'
+            )
+            if not game_data:
+                await event.send(event.plain_result("......准备音频失败，游戏无法开始。"))
+                return
+
+            random.shuffle(another_vocals)
+            game_data['num_options'] = len(another_vocals)
+            game_data['correct_answer_num'] = another_vocals.index(correct_vocal_version) + 1
+            game_data['game_mode'] = 'vocalist'
+
+            def get_vocalist_name(vocal_info):
+                char_list = vocal_info.get('characters', [])
+                if not char_list:
+                    return "未知"
+                
+                char_names = []
+                for char in char_list:
+                    char_id = char.get('characterId')
+                    # 从 cache_service 获取数据
+                    char_data = self.cache_service.character_data.get(str(char_id))
+                    if char_data:
+                        char_names.append(char_data.get("fullName", char_data.get("name", "未知")))
+                    else:
+                        char_names.append("未知")
+                return ' + '.join(char_names)
+            
+            compact_options_text = ""
+            for i, vocal in enumerate(another_vocals):
+                vocalist_name = get_vocalist_name(vocal)
+                compact_options_text += f"{i + 1}. {vocalist_name}\n"
+            
+            timeout_seconds = self._get_setting_for_group(event, "answer_timeout", 30)
+            intro_text = f"这首歌是【{song['title']}】，正在演唱的是谁？[1.5倍速]\n请在{timeout_seconds}秒内发送编号回答。\n\n⚠️ 测试功能，不计分\n\n{compact_options_text}"
+            jacket_source = self.cache_service.get_resource_path_or_url(f"music_jacket/{song['jacketAssetbundleName']}.png")
+            
+            intro_messages = [Comp.Plain(intro_text)]
+            if jacket_source:
+                intro_messages.append(Comp.Image(file=str(jacket_source)))
+                
+            correct_vocalist_name = get_vocalist_name(correct_vocal_version)
+            answer_reveal_messages = [
+                Comp.Plain(f"正确答案是: {game_data['correct_answer_num']}. {correct_vocalist_name}")
+            ]
+
+            await self._run_game_session(event, game_data, intro_messages, answer_reveal_messages)
+        except Exception as e:
+            logger.error(f"游戏启动过程中发生未处理的异常: {e}", exc_info=True)
+            await event.send(event.plain_result("......开始游戏时发生内部错误，已中断。"))
+        finally:
             if session_id in self.context.active_game_sessions:
                 self.context.active_game_sessions.remove(session_id)
-            return
-            
-        correct_vocal_version = random.choice(another_vocals)
-        
-        game_data = await self.audio_service.get_game_clip(
-            force_song_object=song,
-            force_vocal_version=correct_vocal_version,
-            speed_multiplier=1.5,
-            game_type='guess_song_vocalist',
-            guess_type='vocalist',
-            mode_name='猜歌手'
-        )
-        if not game_data:
-            await event.send(event.plain_result("......准备音频失败，游戏无法开始。"))
-            if session_id in self.context.active_game_sessions:
-                self.context.active_game_sessions.remove(session_id)
-            return
-
-        random.shuffle(another_vocals)
-        game_data['num_options'] = len(another_vocals)
-        game_data['correct_answer_num'] = another_vocals.index(correct_vocal_version) + 1
-        game_data['game_mode'] = 'vocalist'
-
-        def get_vocalist_name(vocal_info):
-            char_list = vocal_info.get('characters', [])
-            if not char_list:
-                return "未知"
-            
-            char_names = []
-            for char in char_list:
-                char_id = char.get('characterId')
-                # 从 cache_service 获取数据
-                char_data = self.cache_service.character_data.get(str(char_id))
-                if char_data:
-                    char_names.append(char_data.get("fullName", char_data.get("name", "未知")))
-                else:
-                    char_names.append("未知")
-            return ' + '.join(char_names)
-        
-        compact_options_text = ""
-        for i, vocal in enumerate(another_vocals):
-            vocalist_name = get_vocalist_name(vocal)
-            compact_options_text += f"{i + 1}. {vocalist_name}\n"
-        
-        timeout_seconds = self._get_setting_for_group(event, "answer_timeout", 30)
-        intro_text = f"这首歌是【{song['title']}】，正在演唱的是谁？[1.5倍速]\n请在{timeout_seconds}秒内发送编号回答。\n\n⚠️ 测试功能，不计分\n\n{compact_options_text}"
-        jacket_source = self.cache_service.get_resource_path_or_url(f"music_jacket/{song['jacketAssetbundleName']}.png")
-        
-        intro_messages = [Comp.Plain(intro_text)]
-        if jacket_source:
-            intro_messages.append(Comp.Image(file=str(jacket_source)))
-            
-        correct_vocalist_name = get_vocalist_name(correct_vocal_version)
-        answer_reveal_messages = [
-            Comp.Plain(f"正确答案是: {game_data['correct_answer_num']}. {correct_vocalist_name}")
-        ]
-
-        await self._run_game_session(event, game_data, intro_messages, answer_reveal_messages)
+            self.last_game_end_time[session_id] = time.time()
 
 
     @filter.command("猜歌帮助")
