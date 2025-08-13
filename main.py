@@ -1044,6 +1044,9 @@ class GuessSongPlugin(Star):
                 else:
                     yield event.plain_result("......内部错误，请联系管理员。")
                 return
+            if vocal_info is None:
+                yield event.plain_result(f"......歌曲 \"{song_to_play['title']}\" 没有找到符合要求的 Another Vocal 版本。")
+                return
 
             if vocal_info == 'list_versions':
                  # List versions only
