@@ -542,7 +542,7 @@ class AudioService:
     def _draw_help_image_sync(self) -> Optional[str]:
         """[同步] 帮助图片绘制函数。"""
         try:
-            width, height = 800, 1350
+            width, height = 800, 1750
             bg_color_start, bg_color_end = (230, 240, 255), (200, 210, 240)
             img = Image.new("RGB", (width, height), bg_color_start)
             draw_bg = ImageDraw.Draw(img)
@@ -584,28 +584,39 @@ class AudioService:
             help_text = (
                 "--- PJSK猜歌插件帮助 ---\n\n"
                 "🎵 基础指令\n"
-                f"  `猜歌` - {self.game_modes['normal']['name']} ({self.game_modes['normal']['score']}分)\n"
-                f"  `猜歌 1` - {self.game_modes['1']['name']} ({self.game_modes['1']['score']}分)\n"
-                f"  `猜歌 2` - {self.game_modes['2']['name']} ({self.game_modes['2']['score']}分)\n"
-                f"  `猜歌 3` - {self.game_modes['3']['name']} ({self.game_modes['3']['score']}分)\n"
-                f"  `猜歌 4` - {self.game_modes['4']['name']} ({self.game_modes['4']['score']}分)\n"
-                f"  `猜歌 5` - {self.game_modes['5']['name']} ({self.game_modes['5']['score']}分)\n"
-                f"  `猜歌 6` - {self.game_modes['6']['name']} ({self.game_modes['6']['score']}分)\n"
-                f"  `猜歌 7` - {self.game_modes['7']['name']} ({self.game_modes['7']['score']}分)\n\n"
+                f"  /猜歌 - {self.game_modes['normal']['name']} ({self.game_modes['normal']['score']}分)\n"
+                f"  /猜歌 1 - {self.game_modes['1']['name']} ({self.game_modes['1']['score']}分)\n"
+                f"  /猜歌 2 - {self.game_modes['2']['name']} ({self.game_modes['2']['score']}分)\n"
+                f"  /猜歌 3 - {self.game_modes['3']['name']} ({self.game_modes['3']['score']}分)\n"
+                f"  /猜歌 4 - {self.game_modes['4']['name']} ({self.game_modes['4']['score']}分)\n"
+                f"  /猜歌 5 - {self.game_modes['5']['name']} ({self.game_modes['5']['score']}分)\n"
+                f"  /猜歌 6 - {self.game_modes['6']['name']} ({self.game_modes['6']['score']}分)\n"
+                f"  /猜歌 7 - {self.game_modes['7']['name']} ({self.game_modes['7']['score']}分)\n"
+                "  /随机猜歌 - 随机组合效果 (最高9分)\n"
+                "  /猜歌手 - 竞猜演唱者 (测试功能, 不计分)\n\n"
                 "🎲 高级指令\n"
-                "  `随机猜歌` - 随机组合效果 (最高9分)\n"
-                "  `猜歌手` - 竞猜演唱者 (测试功能, 不计分)\n"
-                "  `听<模式> [歌名/ID]` - 播放指定或随机歌曲的特殊音轨。\n"
-                "    可用模式: 钢琴, 伴奏, 人声, 贝斯, 鼓组\n"
-                "  `听anvo [歌名/ID] [角色名缩写]` - 播放指定或随机的 Another Vocal，你可以选择一个角色来随机播放。\n"
-                "    (所有听歌指令共享每日次数限制)\n\n"
+                "  /听<模式> [歌名/ID] - 播放指定或随机歌曲的特殊音轨。\n"
+                "  可用模式: 钢琴, 伴奏, 人声, 贝斯, 鼓组\n"
+                "  示例:\n"
+                "  /听钢琴: 随机播放一首钢琴曲。\n"
+                "  /听贝斯 Tell Your World: 播放指定歌曲的贝斯音轨。\n"
+                "  /听鼓组 3: 播放ID为3的歌曲的鼓组音轨。\n\n"
+                "  /听anov [歌名/ID] [角色名缩写] - 播放指定或随机的Another Vocal\n"
+                "  示例:\n"
+                "  anov : 随机播放一首Another Vocal\n"
+                "  anov 280 toya : 播放指定Another Vocal\n"
+                "  anov 280 : 查看可播放的Another Vocal版本\n"
+                "  anov miku : 随机播放一首指定角色的Another Vocal\n\n"
+                "注意: 按歌曲名搜索时，需要提供完整的官方名称。\n"
+                "建议先使用查歌指令获取准确的歌曲名或ID。\n"
+                "(所有听歌指令共享每日次数限制)\n\n"
                 "📊 数据统计\n"
-                "  `猜歌分数` - 查看自己的猜歌积分和排名\n"
-                "  `群猜歌排行榜` - 查看本群猜歌排行榜\n"
-                "  `本地猜歌排行榜` - 查看插件本地存储的猜歌排行榜\n"
-                "  `猜歌排行榜` - 查看服务器猜歌总排行榜 (联网)\n"
-                "  `同步分数` - (管理员)将本地总分同步至服务器\n"
-                "  `查看统计` - 查看各题型的正确率排行\n\n"
+                "  /猜歌分数 - 查看自己的猜歌积分和排名\n"
+                "  /群猜歌排行榜 - 查看本群猜歌排行榜\n"
+                "  /本地猜歌排行榜 - 查看插件本地存储的猜歌排行榜\n"
+                "  /猜歌排行榜 - 查看服务器猜歌总排行榜 (联网)\n"
+                "  /同步分数 - (管理员)将本地总分同步至服务器\n"
+                "  /查看统计 - 查看各题型的正确率排行\n\n"
             )
             with Pilmoji(img) as pilmoji:
                 center_x, current_y = width // 2, 80
