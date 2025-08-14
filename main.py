@@ -809,7 +809,6 @@ class GuessSongPlugin(Star):
 
         user_id = str(event.get_sender_id())
         user_name = event.get_sender_name()
-        await event.send(event.plain_result(f"......正在为 {user_name} 生成个人模式统计报告，请稍候..."))
 
         # 直接在代码中定义最低次数门槛
         ranking_min_attempts = 35
