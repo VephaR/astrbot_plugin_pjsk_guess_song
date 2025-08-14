@@ -803,28 +803,72 @@ class GuessSongPlugin(Star):
 
     @filter.command("查看统计", alias={"mode_stats", "题型统计"})
     async def show_mode_stats(self, event: AstrMessageEvent):
-        """显示各题型的正确率统计（图片排行）"""
-        if not await self._is_group_allowed(event): return
-        
-        rows = await self.stats_service.get_mode_stats()
-        if not rows:
-            rows = await self.db_service.get_mode_stats()
-            
-        if not rows:
-            yield event.plain_result("暂无题型统计数据。"); return
-        
-        stats = []
-        for mode, total, correct in rows:
-            acc = (correct * 100 / total) if total > 0 else 0
-            stats.append((mode, total, correct, acc))
-        stats.sort(key=lambda x: x[3])
-        
-        img_path = await self.audio_service.draw_mode_stats_image(stats[:10])
+        """以图片形式显示个人的各题型正确率统计"""
+        if not await self._is_group_allowed(event):
+            return
 
+        user_id = str(event.get_sender_id())
+        user_name = event.get_sender_name()
+        await event.send(event.plain_result(f"......正在为 {user_name} 生成个人模式统计报告，请稍候..."))
+
+        # 直接在代码中定义最低次数门槛
+        ranking_min_attempts = 35
+
+        # 并行获取所有需要的数据
+        server_stats_task = asyncio.create_task(self.stats_service.api_get_user_global_stats(user_id))
+        user_mode_stats_task = asyncio.create_task(self.stats_service.api_get_user_mode_stats(user_id))
+        user_mode_ranks_task = asyncio.create_task(self.stats_service.api_get_user_mode_ranks(user_id, ranking_min_attempts))
+        
+        server_stats, user_mode_stats, user_mode_ranks = await asyncio.gather(
+            server_stats_task, user_mode_stats_task, user_mode_ranks_task
+        )
+
+        if user_mode_stats is None:
+            await event.send(event.plain_result(f"......无法从服务器获取 {user_name} 的统计数据。请稍后再试。"))
+            return
+
+        # --- 数据处理和分类 ---
+        # 聚合关键字 -> 显示名称
+        CORE_AGGREGATION_MAP = {
+            "钢琴": "钢琴", "伴奏": "伴奏", "人声": "人声",
+            "贝斯": "贝斯", "鼓组": "鼓组"
+        }
+
+        core_mode_stats = {v: {"total": 0, "correct": 0} for v in CORE_AGGREGATION_MAP.values()}
+        detailed_stats = []
+
+        # 聚合用户个人数据
+        for stat in user_mode_stats:
+            mode_name, total, correct = stat['mode'], stat['total_attempts'], stat['correct_attempts']
+            for keyword, display_name in CORE_AGGREGATION_MAP.items():
+                if keyword in mode_name:
+                    core_mode_stats[display_name]["total"] += total
+                    core_mode_stats[display_name]["correct"] += correct
+            
+            accuracy = (correct * 100 / total) if total > 0 else 0
+            detailed_stats.append((mode_name, total, correct, accuracy))
+        
+        # 直接使用新 API 返回的排名
+        if user_mode_ranks:
+            for display_name, data in core_mode_stats.items():
+                rank = user_mode_ranks.get(display_name)
+                if rank:
+                    data['rank'] = rank
+
+        detailed_stats.sort(key=lambda x: x[3], reverse=True)
+
+        # --- 调用绘图服务 ---
+        img_path = await self.audio_service.draw_personal_stats_image(
+            user_name,
+            server_stats,
+            core_mode_stats,
+            detailed_stats
+        )
+        
         if img_path:
-            yield event.image_result(img_path)
+            await event.send(event.image_result(img_path))
         else:
-            yield event.plain_result("生成统计图片时出错。")
+            await event.send(event.plain_result("生成个人统计图片时出错。"))
 
     @filter.command("测试猜歌", alias={"test_song", "调试猜歌"})
     async def test_guess_song(self, event: AstrMessageEvent):
