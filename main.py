@@ -117,6 +117,27 @@ class GuessSongPlugin(Star):
         # 2. 如果没有找到，则回退到全局设置 (from main config file)
         return self.config.get(key, default)
 
+    def _get_normalized_session_id(self, event: AstrMessageEvent) -> str:
+        """
+        标准化 session_id，以处理 unified_msg_origin 中可能存在的 user_id 前缀问题。
+        - 标准格式: 'platform:type:group_id' (e.g., 'aiocqhttp:GroupMessage:2342')
+        - 异常格式: 'platform:type:user_id_group_id' (e.g., 'aiocqhttp:GroupMessage:2342_234234')
+        此函数确保无论输入哪种格式，始终返回标准格式。
+        """
+        original_id = event.unified_msg_origin
+        parts = original_id.split(':', 2)
+        if len(parts) == 3:
+            # part[0] is platform, part[1] is message_type
+            session_part = parts[2]
+            # 检查会话部分是否包含下划线，这是异常格式的标志
+            if '_' in session_part:
+                # 假设真实的 group_id 是最后一个下划线之后的部分
+                # e.g., '1132877359_289304205' -> '289304205'
+                core_session_id = session_part.rsplit('_', 1)[-1]
+                return f"{parts[0]}:{parts[1]}:{core_session_id}"
+        # 如果格式正常或解析失败，返回原始ID
+        return original_id
+
     async def _async_init(self):
         """异步初始化所有服务和数据"""
         await self.db_service.init_db()
@@ -131,7 +152,7 @@ class GuessSongPlugin(Star):
         if not await self._is_group_allowed(event):
             return False, None
 
-        session_id = event.unified_msg_origin
+        session_id = self._get_normalized_session_id(event)
         cooldown = self._get_setting_for_group(event, "game_cooldown_seconds", 30)
         limit = self._get_setting_for_group(event, "daily_play_limit", 15)
         debug_mode = self.config.get("debug_mode", False)
@@ -178,7 +199,7 @@ class GuessSongPlugin(Star):
     )
     async def start_guess_song_unified(self, event: AstrMessageEvent):
         """统一处理所有固定模式的猜歌指令"""
-        session_id = event.unified_msg_origin
+        session_id = self._get_normalized_session_id(event)
         if session_id not in self.context.game_session_locks:
             self.context.game_session_locks[session_id] = asyncio.Lock()
         lock = self.context.game_session_locks[session_id]
@@ -271,7 +292,7 @@ class GuessSongPlugin(Star):
     @filter.command("随机猜歌", alias={"rgs"})
     async def start_random_guess_song(self, event: AstrMessageEvent):
         """开始一轮随机特殊模式的猜歌"""
-        session_id = event.unified_msg_origin
+        session_id = self._get_normalized_session_id(event)
         if session_id not in self.context.game_session_locks:
             self.context.game_session_locks[session_id] = asyncio.Lock()
         lock = self.context.game_session_locks[session_id]
@@ -345,7 +366,7 @@ class GuessSongPlugin(Star):
 
     async def _run_game_session(self, event: AstrMessageEvent, game_data: Dict, intro_messages: List, answer_reveal_messages: List):
         """统一的游戏会话执行器，包含简化的统计逻辑。"""
-        session_id = event.unified_msg_origin
+        session_id = self._get_normalized_session_id(event)
         debug_mode = self.config.get("debug_mode", False)
         timeout_seconds = self._get_setting_for_group(event, "answer_timeout", 30)
         correct_players = {}
@@ -477,7 +498,7 @@ class GuessSongPlugin(Star):
             await event.send(event.plain_result("......抱歉，没有找到包含 another_vocal 的歌曲，无法开始游戏。"))
             return
 
-        session_id = event.unified_msg_origin
+        session_id = self._get_normalized_session_id(event)
         if session_id not in self.context.game_session_locks:
             self.context.game_session_locks[session_id] = asyncio.Lock()
         lock = self.context.game_session_locks[session_id]
@@ -586,7 +607,7 @@ class GuessSongPlugin(Star):
         """显示当前群聊的猜歌排行榜"""
         if not await self._is_group_allowed(event): return
 
-        session_id = event.unified_msg_origin
+        session_id = self._get_normalized_session_id(event)
         rows = await self.db_service.get_group_ranking(session_id)
 
         if not rows:
@@ -649,7 +670,7 @@ class GuessSongPlugin(Star):
         """显示用户在本群、服务器和本地的总分数统计。"""
         user_id = str(event.get_sender_id())
         user_name = event.get_sender_name()
-        session_id = event.unified_msg_origin
+        session_id = self._get_normalized_session_id(event)
         
         server_stats_task = asyncio.create_task(self.stats_service.api_get_user_global_stats(user_id))
         
@@ -902,7 +923,7 @@ class GuessSongPlugin(Star):
         """统一处理所有"听歌"类指令（钢琴、伴奏、人声等）的通用逻辑。"""
         if not await self._is_group_allowed(event): return
 
-        session_id = event.unified_msg_origin
+        session_id = self._get_normalized_session_id(event)
         if session_id not in self.context.game_session_locks:
             self.context.game_session_locks[session_id] = asyncio.Lock()
         lock = self.context.game_session_locks[session_id]
@@ -1010,7 +1031,7 @@ class GuessSongPlugin(Star):
     async def listen_to_another_vocal(self, event: AstrMessageEvent):
         """听指定歌曲的 another vocal 版本。支持多种用法。"""
         if not await self._is_group_allowed(event): return
-        session_id = event.unified_msg_origin
+        session_id = self._get_normalized_session_id(event)
         if session_id not in self.context.game_session_locks:
             self.context.game_session_locks[session_id] = asyncio.Lock()
         lock = self.context.game_session_locks[session_id]
