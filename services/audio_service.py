@@ -13,6 +13,9 @@ from functools import partial
 from collections import defaultdict
 from PIL import Image, ImageDraw, ImageFont
 from datetime import datetime
+from PIL import Image, ImageDraw, ImageFont
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional
 
 try:
     from pydub import AudioSegment
@@ -889,6 +892,134 @@ class AudioService:
             return str(output_path)
         except Exception as e:
             logger.error(f"FFmpeg执行失败: {e}", exc_info=True)
+            return None
+    # 在 services/audio_service.py 的 AudioService 类中添加此方法
+
+    async def draw_personal_stats_image(
+        self,
+        user_name: str,
+        server_stats: Optional[Dict],
+        core_mode_stats: Dict,
+        detailed_stats: List[Tuple[str, int, int, float]],
+    ) -> Optional[str]:
+        """[异步] 绘制个人统计报告图片。"""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            self.executor,
+            self._draw_personal_stats_image_sync,
+            user_name,
+            server_stats,
+            core_mode_stats,
+            detailed_stats
+        )
+
+    def _draw_personal_stats_image_sync(
+        self,
+        user_name: str,
+        server_stats: Optional[Dict],
+        core_mode_stats: Dict,
+        detailed_stats: List[Tuple[str, int, int, float]],
+    ) -> Optional[str]:
+        """[同步] 个人统计报告图片绘制函数 (修正绘图上下文)。"""
+        try:
+            width, height = 1000, 1200
+            
+            background_path = self.resources_dir / "ranking_bg.png"
+            if background_path.exists():
+                img = Image.open(background_path).convert("RGBA")
+                if img.size != (width, height):
+                    img = img.resize((width, height), LANCZOS)
+            else:
+                img = Image.new("RGBA", (width, height), (230, 240, 255)).convert("RGBA")
+            
+            white_overlay = Image.new("RGBA", img.size, (255, 255, 255, 185))
+            img = Image.alpha_composite(img, white_overlay)
+
+            font_path = self.resources_dir / "font.ttf"
+            font_title = ImageFont.truetype(str(font_path), 38)
+            font_subtitle = ImageFont.truetype(str(font_path), 24)
+            font_header = ImageFont.truetype(str(font_path), 28)
+            font_body_bold = ImageFont.truetype(str(font_path), 26)
+            font_body = ImageFont.truetype(str(font_path), 24)
+            font_footer = ImageFont.truetype(str(font_path), 16)
+
+            c_title = (40, 45, 60)
+            c_text = (50, 55, 70)
+            c_highlight = (10, 130, 140)
+            c_dim = (140, 145, 160)
+            c_line = (200, 205, 215, 150)
+
+            # 关键修正: 统一在 Pilmoji 上下文管理器中进行所有绘制
+            with Pilmoji(img) as pilmoji:
+                # 从 Pilmoji 获取唯一的 Draw 对象
+                draw = pilmoji.draw
+
+                center_x, margin, y = width // 2, 100, 100
+                
+                pilmoji.text((center_x, y), f"{user_name} 的模式统计报告", font=font_title, fill=c_title, anchor="ms")
+                y += 50
+                
+                if server_stats and server_stats.get('rank') is not None:
+                    server_text = f"全服总排名: {server_stats.get('rank', 'N/A')}   |   总分数: {server_stats.get('total_score', 0)}"
+                else:
+                    server_text = "全服总排名: 暂无数据"
+                pilmoji.text((center_x, y), server_text, font=font_subtitle, fill=c_text, anchor="ms")
+                y += 50
+                draw.line([(margin, y), (width - margin, y)], fill=c_line, width=2)
+                y += 35
+
+                x_name, x_rank, x_percent, x_counts = margin, 500, 750, width - margin
+                
+                pilmoji.text((x_name, y), "核心模式表现", font=font_header, fill=c_title, anchor="ls")
+                pilmoji.text((x_rank, y), "全服排名", font=font_header, fill=c_title, anchor="ms")
+                y += 55
+
+                for name, data in core_mode_stats.items():
+                    total, correct, rank = data.get('total', 0), data.get('correct', 0), data.get('rank')
+                    accuracy = (correct * 100 / total) if total > 0 else 0
+                    
+                    pilmoji.text((x_name, y), name, font=font_body_bold, fill=c_text, anchor="ls")
+                    if rank:
+                        pilmoji.text((x_rank, y), f"#{rank}", font=font_body_bold, fill=c_text, anchor="ms")
+                    else:
+                        pilmoji.text((x_rank, y), "未上榜", font=font_body, fill=c_dim, anchor="ms")
+                    
+                    pilmoji.text((x_counts, y), f"({correct}/{total})", font=font_body, fill=c_dim, anchor="rs")
+                    pilmoji.text((x_percent, y), f"{accuracy:.1f}%", font=font_body_bold, fill=c_highlight, anchor="rs")
+                    y += 48
+                
+                y += 20
+                draw.line([(margin, y), (width - margin, y)], fill=c_line, width=2)
+                y += 35
+
+                pilmoji.text((x_name, y), "详细模式统计 (按正确率排序)", font=font_header, fill=c_title, anchor="ls")
+                y += 50
+                x_detail_name = x_name + 20
+                
+                for name, total, correct, accuracy in detailed_stats[:15]:
+                    if y > height - 90: break
+                    
+                    max_width = x_percent - x_detail_name - 30
+                    display_name = name
+                    if pilmoji.getsize(display_name, font=font_body)[0] > max_width:
+                        while pilmoji.getsize(display_name + "...", font=font_body)[0] > max_width and len(display_name) > 1:
+                            display_name = display_name[:-1]
+                        display_name += "..."
+
+                    pilmoji.text((x_detail_name, y), f"· {display_name}", font=font_body, fill=c_text, anchor="ls")
+                    pilmoji.text((x_counts, y), f"({correct}/{total})", font=font_body, fill=c_dim, anchor="rs")
+                    pilmoji.text((x_percent, y), f"{accuracy:.1f}%", font=font_body_bold, fill=c_highlight, anchor="rs")
+                    y += 42
+
+                footer_text = f"GuessSong v{self.plugin_version} | Generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                pilmoji.text((center_x, height - 65), footer_text, font=font_footer, fill=c_dim, anchor="ms")
+
+            output_path = self.output_dir / f"personal_stats_{user_name}_{int(time.time())}.png"
+            img.save(output_path)
+            return str(output_path)
+            
+        except Exception as e:
+            logger.error(f"生成个人统计图片时出错: {e}", exc_info=True)
             return None
 
     async def terminate(self):

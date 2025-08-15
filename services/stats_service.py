@@ -157,6 +157,52 @@ class StatsService:
                     logger.error(f"分数同步失败，服务器返回错误：{response.status} {await response.text()}")
         except Exception as e:
             logger.error(f"同步服务器分数失败: {e}", exc_info=True)
+ 
+    async def api_get_user_mode_stats(self, user_id: str) -> Optional[List[Dict]]:
+        """从服务器获取单个用户的模式游玩统计数据。"""
+        if not self.api_key or not self.stats_server_url:
+            return None
+        
+        url = f"{self.stats_server_url}/api/user_mode_stats/{user_id}"
+        headers = {'X-API-KEY': self.api_key}
+        
+        try:
+            async with aiohttp.ClientSession(headers=headers) as session:
+                async with session.get(url, timeout=10) as response:
+                    if response.status == 200:
+                        return await response.json()
+                    else:
+                        logger.warning(f"获取用户模式统计失败 (用户ID: {user_id}): 服务器返回状态 {response.status}")
+                        return None
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            logger.error(f"访问服务器时出错 (获取用户模式统计): {e}")
+            raise  # 重新抛出异常，让调用方处理
+        except Exception as e:
+            logger.error(f"处理用户模式统计响应时发生未知错误: {e}")
+            return None            
+    async def api_get_user_mode_ranks(self, user_id: str, min_attempts: int) -> Optional[Dict]:
+        """从服务器获取单个用户在各核心模式中的全服排名。"""
+        if not self.api_key or not self.stats_server_url:
+            return None
+        
+        url = f"{self.stats_server_url}/api/user_mode_ranks/{user_id}"
+        params = {"min_attempts": min_attempts}
+        headers = {'X-API-KEY': self.api_key}
+        
+        try:
+            async with aiohttp.ClientSession(headers=headers) as session:
+                async with session.get(url, params=params, timeout=15) as response:
+                    if response.status == 200:
+                        return await response.json()
+                    else:
+                        logger.warning(f"获取用户模式排名失败 (用户ID: {user_id}): 服务器返回状态 {response.status}")
+                        return None
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            logger.error(f"访问服务器时出错 (获取用户模式排名): {e}")
+            return None
+        except Exception as e:
+            logger.error(f"处理用户模式排名响应时发生未知错误: {e}")
+            return None
 
     async def terminate(self):
         """关闭 aiohttp session"""
