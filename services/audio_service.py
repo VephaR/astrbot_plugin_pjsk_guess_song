@@ -2,6 +2,7 @@ import asyncio
 import io
 import random
 import os
+import re
 import subprocess
 import time
 import itertools
@@ -45,6 +46,10 @@ class AudioService:
         self.plugin_version = plugin_version
         self.executor = ThreadPoolExecutor(max_workers=5)
         self._session: Optional[aiohttp.ClientSession] = None
+        
+        # 硬编码静音检测的配置
+        self.vocals_silence_detection = True
+        self.silence_threshold_dbfs = -35  # dBFS, 数值越大要求越严
         
         self.game_effects = {
             'speed_2x': {'name': '2倍速', 'score': 1, 'kwargs': {'speed_multiplier': 2.0}},
@@ -104,121 +109,176 @@ class AudioService:
         准备一轮新游戏。该函数现在会智能选择处理路径：
         - 快速路径：对简单裁剪任务直接使用ffmpeg，性能更高。
         - 慢速路径：对需要变速、倒放等复杂效果的任务，使用pydub。
+        - 智能路径：对人声模式，会先用ffmpeg快速检测，如果多次失败则更换歌曲。
         """
         if not self.cache_service.song_data or not PYDUB_AVAILABLE:
             logger.error("无法开始游戏: 歌曲数据未加载或pydub未安装。")
             return None
 
-        song = kwargs.get("force_song_object")
+        # --- 新的歌曲选择与静音检测逻辑 ---
+
+        # 硬编码的重试次数
+        MAX_SONG_RETRIES = 3  # 最多换3首歌
+        MAX_SEGMENT_RETRIES_PER_SONG = 3 # 每首歌里找3次
+
         preprocessed_mode = kwargs.get("play_preprocessed")
         is_piano_mode = kwargs.get("melody_to_piano", False)
+        loop = asyncio.get_running_loop()
         
-        if not song:
-            if preprocessed_mode:
-                available_bundles = self.cache_service.preprocessed_tracks.get(preprocessed_mode, set())
-                if not available_bundles:
-                    logger.error(f"无法开始 {preprocessed_mode} 模式: 没有找到任何预处理的音轨文件。")
-                    return None
-                chosen_bundle = random.choice(list(available_bundles))
-                song = self.cache_service.bundle_to_song_map.get(chosen_bundle)
-            elif is_piano_mode:
-                if not self.cache_service.available_piano_songs:
-                    logger.error("无法开始钢琴模式: 没有找到任何预生成的钢琴曲。")
-                    return None
-                song = random.choice(self.cache_service.available_piano_songs)
-            else:
-                song = random.choice(self.cache_service.song_data)
+        song = kwargs.get("force_song_object")
+        audio_source = None
+        forced_start_ms = None
         
-        if not song:
-            logger.error("在游戏准备的步骤一中未能确定歌曲。")
-            return None
-
-        audio_source: Optional[Union[Path, str]] = None
-        audio_format = "mp3"
-        vocal_version = kwargs.get("force_vocal_version")
-
-        if preprocessed_mode:
-            possible_bundles = [v['vocalAssetbundleName'] for v in song.get('vocals', [])
-                                if v['vocalAssetbundleName'] in self.cache_service.preprocessed_tracks.get(preprocessed_mode, set())]
-            if not possible_bundles:
-                logger.error(f"歌曲 '{song.get('title')}' 没有适用于 '{preprocessed_mode}' 模式的可用音轨。")
-                return None
-            chosen_bundle = random.choice(possible_bundles)
-            relative_path = f"{preprocessed_mode}/{chosen_bundle}.mp3"
-            audio_source = self.cache_service.get_resource_path_or_url(relative_path)
-        elif is_piano_mode:
-            all_song_bundles = {v['vocalAssetbundleName'] for v in song.get('vocals', [])}
-            valid_piano_bundles = list(all_song_bundles.intersection(self.cache_service.available_piano_songs_bundles))
-            if not valid_piano_bundles:
-                logger.error(f"逻辑错误：歌曲 '{song.get('title')}' 在可用钢琴曲列表中，但找不到任何有效的音轨bundle。")
-                return None
-            chosen_bundle = random.choice(valid_piano_bundles)
-            relative_path = f"songs_piano_trimmed_mp3/{chosen_bundle}/{chosen_bundle}.mp3"
-            audio_source = self.cache_service.get_resource_path_or_url(relative_path)
-        else:
-            if not vocal_version:
-                if not song.get("vocals"):
-                    logger.error(f"歌曲 '{song.get('title')}' 没有任何演唱版本信息。")
-                    return None
-                sekai_ver = next((v for v in song.get('vocals', []) if v.get('musicVocalType') == 'sekai'), None)
-                vocal_version = sekai_ver if sekai_ver else random.choice(song.get("vocals", []))
+        # 外层循环：换歌
+        for song_attempt in range(MAX_SONG_RETRIES):
+            # 1. 选择一首歌
+            if not song:
+                if preprocessed_mode:
+                    available_bundles = self.cache_service.preprocessed_tracks.get(preprocessed_mode, set())
+                    if not available_bundles:
+                        logger.error(f"无法开始 {preprocessed_mode} 模式: 没有找到任何预处理的音轨文件。")
+                        return None
+                    chosen_bundle = random.choice(list(available_bundles))
+                    song = self.cache_service.bundle_to_song_map.get(chosen_bundle)
+                elif is_piano_mode:
+                    if not self.cache_service.available_piano_songs:
+                        logger.error("无法开始钢琴模式: 没有找到任何预生成的钢琴曲。")
+                        return None
+                    song = random.choice(self.cache_service.available_piano_songs)
+                else:
+                    song = random.choice(self.cache_service.song_data)
             
-            if vocal_version:
-                bundle_name = vocal_version["vocalAssetbundleName"]
-                relative_path = f"songs/{bundle_name}/{bundle_name}.mp3"
-                audio_source = self.cache_service.get_resource_path_or_url(relative_path)
+            if not song:
+                logger.error("在游戏准备的步骤一中未能确定歌曲。")
+                return None
+            
+            logger.debug(f"歌曲尝试 {song_attempt + 1}/{MAX_SONG_RETRIES}: 选择歌曲 '{song.get('title')}'")
 
-        if not audio_source:
-            mode_name = preprocessed_mode or ('piano' if is_piano_mode else 'normal')
-            song_title = song.get('title')
-            logger.error(f"未能为歌曲 '{song_title}' 的 '{mode_name}' 模式找到有效的音频文件。")
+            # 2. 定位音频源文件
+            vocal_version = kwargs.get("force_vocal_version")
+            if preprocessed_mode:
+                possible_bundles = [v['vocalAssetbundleName'] for v in song.get('vocals', []) if v['vocalAssetbundleName'] in self.cache_service.preprocessed_tracks.get(preprocessed_mode, set())]
+                if not possible_bundles: audio_source = None
+                else:
+                    chosen_bundle = random.choice(possible_bundles)
+                    audio_source = self.cache_service.get_resource_path_or_url(f"{preprocessed_mode}/{chosen_bundle}.mp3")
+            elif is_piano_mode:
+                all_song_bundles = {v['vocalAssetbundleName'] for v in song.get('vocals', [])}
+                valid_piano_bundles = list(all_song_bundles.intersection(self.cache_service.available_piano_songs_bundles))
+                if not valid_piano_bundles: audio_source = None
+                else:
+                    chosen_bundle = random.choice(valid_piano_bundles)
+                    audio_source = self.cache_service.get_resource_path_or_url(f"songs_piano_trimmed_mp3/{chosen_bundle}/{chosen_bundle}.mp3")
+            else:
+                if not vocal_version:
+                    sekai_ver = next((v for v in song.get('vocals', []) if v.get('musicVocalType') == 'sekai'), None)
+                    vocal_version = sekai_ver if sekai_ver else (random.choice(song.get("vocals", [])) if song.get("vocals") else None)
+                if vocal_version:
+                    bundle_name = vocal_version["vocalAssetbundleName"]
+                    audio_source = self.cache_service.get_resource_path_or_url(f"songs/{bundle_name}/{bundle_name}.mp3")
+                else: audio_source = None
+
+            if not audio_source:
+                logger.warning(f"歌曲 '{song.get('title')}' 没有有效的音频源文件，尝试下一首。")
+                song = None # 重置 song 以便下次循环重新随机选择
+                continue
+
+            # 3. 如果是人声模式，进行片段检测
+            if self.vocals_silence_detection and preprocessed_mode == 'vocals_only':
+                try:
+                    target_duration_s = self.config.get("clip_duration_seconds", 10)
+                    total_duration_ms = await loop.run_in_executor(self.executor, self._get_duration_ms_ffprobe_sync, audio_source)
+                    if total_duration_ms is None: raise ValueError("ffprobe failed")
+
+                    # 内层循环：在当前歌曲中寻找片段
+                    is_segment_found = False
+                    for segment_attempt in range(MAX_SEGMENT_RETRIES_PER_SONG):
+                        start_range_min = int(song.get("fillerSec", 0) * 1000)
+                        start_range_max = int(total_duration_ms - (target_duration_s * 1000))
+                        
+                        random_start_s = (random.randint(start_range_min, start_range_max) if start_range_min < start_range_max else start_range_min) / 1000.0
+                        
+                        mean_dbfs = await self._get_segment_mean_dbfs_ffmpeg(audio_source, random_start_s, target_duration_s)
+                        
+                        if mean_dbfs is not None and mean_dbfs > self.silence_threshold_dbfs:
+                            logger.debug(f"片段尝试 {segment_attempt + 1}: 找到有效人声片段 (响度: {mean_dbfs:.2f} dBFS)。")
+                            forced_start_ms = int(random_start_s * 1000)
+                            is_segment_found = True
+                            break # 成功找到，跳出内层循环
+                        else:
+                            logger.debug(f"片段尝试 {segment_attempt + 1}: 人声片段过静 (响度: {mean_dbfs or -999.0:.2f} dBFS)，重试。")
+
+                    if is_segment_found:
+                        break # 成功找到，跳出外层循环
+                    else:
+                        logger.warning(f"歌曲 '{song.get('title')}' 在 {MAX_SEGMENT_RETRIES_PER_SONG} 次尝试后未找到有效片段，更换歌曲。")
+                        song = None # 重置 song 以便下次循环重新随机选择
+                        continue # 继续外层循环，换歌
+
+                except Exception as e:
+                    logger.error(f"对歌曲 '{song.get('title')}' 进行静音检测时失败: {e}，更换歌曲。")
+                    song = None
+                    continue
+            else:
+                # 如果不是人声模式，第一次选歌就成功
+                break
+        
+        # 循环结束后，检查是否最终找到了可用歌曲和片段
+        if not song or not audio_source:
+            logger.error(f"在 {MAX_SONG_RETRIES} 次尝试后，未能找到任何有效的歌曲和音频片段来开始游戏。")
             return None
 
+        # --- 后续处理逻辑 ---
+        
         is_bass_boost = preprocessed_mode == 'bass_only'
         has_speed_change = kwargs.get("speed_multiplier", 1.0) != 1.0
         has_reverse = kwargs.get("reverse_audio", False)
         has_band_pass = kwargs.get("band_pass")
         use_slow_path = is_bass_boost or has_speed_change or has_reverse or has_band_pass
-
-        loop = asyncio.get_running_loop()
         
-        if not use_slow_path:
+        # 如果是人声模式且无复杂效果，可以走快速路径
+        if preprocessed_mode == 'vocals_only' and not use_slow_path:
+            logger.debug("人声模式无复杂效果，使用ffmpeg快速路径进行裁剪。")
+            clip_path_obj = self.output_dir / f"clip_{int(time.time())}.mp3"
+            command = [
+                'ffmpeg', '-ss', str(forced_start_ms / 1000.0), '-i', str(audio_source),
+                '-t', str(self.config.get("clip_duration_seconds", 10)), '-c', 'copy', '-y', str(clip_path_obj)
+            ]
+            run_subprocess = partial(subprocess.run, command, capture_output=True, text=True, check=True, encoding='utf-8')
+            result = await loop.run_in_executor(self.executor, run_subprocess)
+            if result.returncode != 0: raise RuntimeError(f"ffmpeg clipping failed: {result.stderr}")
+            
+            mode_key = kwargs.get("random_mode_name") or kwargs.get('play_preprocessed') or ("melody_to_piano" if is_piano_mode else "normal")
+            return {"song": song, "clip_path": str(clip_path_obj), "score": kwargs.get("score", 1), "mode": mode_key, "game_type": kwargs.get('game_type')}
+        
+        # 如果是其他简单模式，走原来的快速路径
+        if not use_slow_path and not (preprocessed_mode == 'vocals_only'):
+            # ... (原有快速路径逻辑) ...
             try:
                 total_duration_ms = await loop.run_in_executor(self.executor, self._get_duration_ms_ffprobe_sync, audio_source)
                 if total_duration_ms is None: raise ValueError("ffprobe failed or not found.")
-
                 target_duration_ms = int(self.config.get("clip_duration_seconds", 10) * 1000)
                 if preprocessed_mode in ["drums_only", "bass_only"]: target_duration_ms *= 2
-                source_duration_ms = target_duration_ms
-                
                 start_range_min = 0
                 if not preprocessed_mode and not is_piano_mode:
                     start_range_min = int(song.get("fillerSec", 0) * 1000)
-                
-                start_range_max = int(total_duration_ms - source_duration_ms)
+                start_range_max = int(total_duration_ms - target_duration_ms)
                 start_ms = random.randint(start_range_min, start_range_max) if start_range_min < start_range_max else start_range_min
-                duration_to_clip_ms = source_duration_ms
-
                 clip_path_obj = self.output_dir / f"clip_{int(time.time())}.mp3"
                 command = [
                     'ffmpeg', '-ss', str(start_ms / 1000.0), '-i', str(audio_source),
-                    '-t', str(duration_to_clip_ms / 1000.0), '-c', 'copy', '-y', str(clip_path_obj)
+                    '-t', str(target_duration_ms / 1000.0), '-c', 'copy', '-y', str(clip_path_obj)
                 ]
-                
                 run_subprocess = partial(subprocess.run, command, capture_output=True, text=True, check=True, encoding='utf-8')
-                result = await loop.run_in_executor(self.executor, run_subprocess)
-
-                if result.returncode != 0: raise RuntimeError(f"ffmpeg clipping failed: {result.stderr}")
-                
+                await loop.run_in_executor(self.executor, run_subprocess)
                 mode_key = kwargs.get("random_mode_name") or kwargs.get('play_preprocessed') or ("melody_to_piano" if is_piano_mode else "normal")
-                
                 return {"song": song, "clip_path": str(clip_path_obj), "score": kwargs.get("score", 1), "mode": mode_key, "game_type": kwargs.get('game_type')}
-
             except Exception as e:
                 logger.warning(f"快速路径处理失败: {e}. 将回退到 pydub 慢速路径。")
-        
-        # 慢速路径 (使用pydub，兼容复杂效果)
+
+        # 慢速路径 (pydub)
         try:
+            # ... (原有慢速路径逻辑) ...
             audio_data: Union[str, Path, io.BytesIO]
             if isinstance(audio_source, str) and audio_source.startswith(('http://', 'https://')):
                 session = await self._get_session()
@@ -238,24 +298,51 @@ class AudioService:
                 "reverse_audio": kwargs.get("reverse_audio", False),
                 "band_pass": kwargs.get("band_pass"),
                 "is_piano_mode": is_piano_mode,
-                "song_filler_sec": song.get("fillerSec", 0)
+                "song_filler_sec": song.get("fillerSec", 0),
+                "force_start_ms": forced_start_ms
             }
             
-            clip = await loop.run_in_executor(self.executor, self._process_audio_with_pydub, audio_data, audio_format, pydub_kwargs)
-
+            clip = await loop.run_in_executor(self.executor, self._process_audio_with_pydub, audio_data, "mp3", pydub_kwargs)
             if clip is None: raise RuntimeError("pydub audio processing failed.")
-
             mode = kwargs.get("random_mode_name") or kwargs.get('play_preprocessed') or ("melody_to_piano" if is_piano_mode else "normal")
-            
             clip_path = self.output_dir / f"clip_{int(time.time())}.mp3"
             clip.export(clip_path, format="mp3", bitrate="128k")
-
             return {"song": song, "clip_path": str(clip_path), "score": kwargs.get("score", 1), "mode": mode, "game_type": kwargs.get('game_type')}
-
         except Exception as e:
             logger.error(f"慢速路径 (pydub) 处理音频文件 {audio_source} 时失败: {e}", exc_info=True)
             return None
     
+    async def _get_segment_mean_dbfs_ffmpeg(self, file_path: Union[Path, str], start_s: float, duration_s: float) -> Optional[float]:
+        """[异步] 使用ffmpeg快速检测指定音频片段的平均音量(dBFS)。"""
+        command = [
+            'ffmpeg', '-hide_banner', '-ss', str(start_s), '-t', str(duration_s),
+            '-i', str(file_path), '-af', 'volumedetect', '-f', 'null', '-'
+        ]
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            _, stderr_bytes = await proc.communicate()
+            stderr_str = stderr_bytes.decode('utf-8', errors='ignore')
+
+            # 使用正则从ffmpeg的输出中解析 mean_volume
+            match = re.search(r"mean_volume:\s*(-?[\d\.]+)\s*dB", stderr_str)
+            if match:
+                return float(match.group(1))
+            
+            logger.warning(f"无法从ffmpeg输出中解析mean_volume: {stderr_str}")
+            return -999.0 # 返回一个极小值，表示检测失败但非致命
+        except FileNotFoundError:
+            logger.error("ffmpeg 未安装或不在系统路径中。无法执行静音检测。")
+            # 禁用后续检测以避免重复报错
+            self.vocals_silence_detection = False
+            return 0.0 # 返回一个高值，以允许游戏继续
+        except Exception as e:
+            logger.error(f"执行ffmpeg volumedetect时出错: {e}")
+            return -999.0
+
     def _get_duration_ms_ffprobe_sync(self, file_path: Union[Path, str]) -> Optional[float]:
         """[同步] 使用 ffprobe 高效获取音频时长。"""
         command = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', str(file_path)]
@@ -281,11 +368,16 @@ class AudioService:
             if source_duration_ms >= total_duration_ms:
                 clip_segment = audio
             else:
-                start_range_min = 0
-                if not preprocessed_mode and not options.get("is_piano_mode"):
-                    start_range_min = int(options.get("song_filler_sec", 0) * 1000)
-                start_range_max = total_duration_ms - source_duration_ms
-                start_ms = random.randint(start_range_min, start_range_max) if start_range_min < start_range_max else start_range_min
+                forced_start_ms = options.get("force_start_ms")
+                if forced_start_ms is not None:
+                    start_ms = forced_start_ms
+                else:
+                    start_range_min = 0
+                    if not preprocessed_mode and not options.get("is_piano_mode"):
+                        start_range_min = int(options.get("song_filler_sec", 0) * 1000)
+                    start_range_max = total_duration_ms - source_duration_ms
+                    start_ms = random.randint(start_range_min, start_range_max) if start_range_min < start_range_max else start_range_min
+                
                 end_ms = start_ms + source_duration_ms
                 clip_segment = audio[start_ms:end_ms]
 
