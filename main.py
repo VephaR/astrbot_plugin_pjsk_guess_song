@@ -171,6 +171,7 @@ class GuessSongPlugin(Star):
         cooldown = self._get_setting_for_group(event, "game_cooldown_seconds", 30)
         limit = self._get_setting_for_group(event, "daily_play_limit", 15)
         debug_mode = self.config.get("debug_mode", False)
+        is_independent_limit = self._get_setting_for_group(event, "independent_daily_limit", False)
 
         if not debug_mode and time.time() - self.last_game_end_time.get(session_id, 0) < cooldown:
             remaining_time = cooldown - (time.time() - self.last_game_end_time.get(session_id, 0))
@@ -180,9 +181,10 @@ class GuessSongPlugin(Star):
         if session_id in self.context.active_game_sessions:
             return False, "......有一个正在进行的游戏了呢。"
 
-        can_play = await self.db_service.can_play(event.get_sender_id(), limit)
+        can_play = await self.db_service.can_play(event.get_sender_id(), limit, session_id, is_independent_limit)
         if not debug_mode and not can_play:
-            return False, f"......你今天的游戏次数已达上限（{limit}次），请明天再来吧......"
+            limit_type = "本群" if is_independent_limit else "你"
+            return False, f"......{limit_type}今天的游戏次数已达上限（{limit}次），请明天再来吧......"
 
         return True, None
     
@@ -238,7 +240,8 @@ class GuessSongPlugin(Star):
         try:
             initiator_id = event.get_sender_id()
             initiator_name = event.get_sender_name()
-            await self.db_service.consume_daily_play_attempt(initiator_id, initiator_name)
+            is_independent_limit = self._get_setting_for_group(event, "independent_daily_limit", False)
+            await self.db_service.consume_daily_play_attempt(initiator_id, initiator_name, session_id, is_independent_limit)
             await self.stats_service.api_ping("guess_song")
             
             mode_config = self.game_modes.get(mode_key)
@@ -325,7 +328,8 @@ class GuessSongPlugin(Star):
         try:
             initiator_id = event.get_sender_id()
             initiator_name = event.get_sender_name()
-            await self.db_service.consume_daily_play_attempt(initiator_id, initiator_name)
+            is_independent_limit = self._get_setting_for_group(event, "independent_daily_limit", False)
+            await self.db_service.consume_daily_play_attempt(initiator_id, initiator_name, session_id, is_independent_limit)
             await self.stats_service.api_ping("guess_song_random")
 
             combined_kwargs, total_score, effect_names_display, mode_name_str = self.audio_service.get_random_mode_config()
@@ -535,7 +539,8 @@ class GuessSongPlugin(Star):
         try:
             initiator_id = event.get_sender_id()
             initiator_name = event.get_sender_name()
-            await self.db_service.consume_daily_play_attempt(initiator_id, initiator_name)
+            is_independent_limit = self._get_setting_for_group(event, "independent_daily_limit", False)
+            await self.db_service.consume_daily_play_attempt(initiator_id, initiator_name, session_id, is_independent_limit)
             await self.stats_service.api_ping("guess_song_vocalist")
             
             debug_mode = self.config.get("debug_mode", False)
@@ -759,25 +764,28 @@ class GuessSongPlugin(Star):
                 "  - 暂无记录"
             )
 
-        if local_global_stats:
-            today = datetime.now().strftime("%Y-%m-%d")
-            daily_plays = local_global_stats.get('daily_plays', 0)
-            last_play_date = local_global_stats.get('last_play_date', '')
-            games_today = daily_plays if last_play_date == today else 0
-            
-            # 使用新的辅助函数动态获取限制
-            play_limit = self._get_setting_for_group(event, "daily_play_limit", 15)
-            listen_limit = self._get_setting_for_group(event, "daily_listen_limit", 10)
-            
-            _, listen_today = await self.db_service.get_user_daily_limits(user_id)
-            
-            remaining_plays = max(0, play_limit - games_today)
-            remaining_listens = max(0, listen_limit - listen_today)
-            result_parts.append(
-                f"🕒 剩余次数\n"
-                f"  - 猜歌: {remaining_plays}/{play_limit}\n"
-                f"  - 听歌: {remaining_listens}/{listen_limit}"
-            )
+        # --- 剩余次数计算 ---
+        # 检查当前群聊是否配置为独立次数
+        is_independent_limit = self._get_setting_for_group(event, "independent_daily_limit", False)
+
+        # 使用新的辅助函数动态获取限制
+        play_limit = self._get_setting_for_group(event, "daily_play_limit", 15)
+        listen_limit = self._get_setting_for_group(event, "daily_listen_limit", 10)
+
+        # 获取今日已玩次数 (根据是否独立来决定查询方式)
+        games_today = await self.db_service.get_games_played_today(user_id, session_id, is_independent_limit)
+        _, listen_today = await self.db_service.get_user_daily_limits(user_id)
+        
+        remaining_plays = max(0, play_limit - games_today)
+        remaining_listens = max(0, listen_limit - listen_today)
+        
+        # 根据模式显示不同的提示
+        limit_type_str = " (本群)" if is_independent_limit else ""
+        result_parts.append(
+            f"🕒 剩余次数\n"
+            f"  - 猜歌{limit_type_str}: {remaining_plays}/{play_limit}\n"
+            f"  - 听歌: {remaining_listens}/{listen_limit}"
+        )
 
         await event.send(event.plain_result("\n\n".join(result_parts)))
     
