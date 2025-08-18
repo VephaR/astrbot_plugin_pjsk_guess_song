@@ -171,6 +171,7 @@ class GuessSongPlugin(Star):
         cooldown = self._get_setting_for_group(event, "game_cooldown_seconds", 30)
         limit = self._get_setting_for_group(event, "daily_play_limit", 15)
         debug_mode = self.config.get("debug_mode", False)
+        is_independent_limit = self._get_setting_for_group(event, "independent_daily_limit", False)
 
         if not debug_mode and time.time() - self.last_game_end_time.get(session_id, 0) < cooldown:
             remaining_time = cooldown - (time.time() - self.last_game_end_time.get(session_id, 0))
@@ -180,9 +181,10 @@ class GuessSongPlugin(Star):
         if session_id in self.context.active_game_sessions:
             return False, "......有一个正在进行的游戏了呢。"
 
-        can_play = await self.db_service.can_play(event.get_sender_id(), limit)
+        can_play = await self.db_service.can_play(event.get_sender_id(), limit, session_id, is_independent_limit)
         if not debug_mode and not can_play:
-            return False, f"......你今天的游戏次数已达上限（{limit}次），请明天再来吧......"
+            limit_type = "本群" if is_independent_limit else "你"
+            return False, f"......{limit_type}今天的游戏次数已达上限（{limit}次），请明天再来吧......"
 
         return True, None
     
@@ -238,7 +240,8 @@ class GuessSongPlugin(Star):
         try:
             initiator_id = event.get_sender_id()
             initiator_name = event.get_sender_name()
-            await self.db_service.consume_daily_play_attempt(initiator_id, initiator_name)
+            is_independent_limit = self._get_setting_for_group(event, "independent_daily_limit", False)
+            await self.db_service.consume_daily_play_attempt(initiator_id, initiator_name, session_id, is_independent_limit)
             await self.stats_service.api_ping("guess_song")
             
             mode_config = self.game_modes.get(mode_key)
@@ -295,7 +298,9 @@ class GuessSongPlugin(Star):
             if jacket_source:
                 answer_reveal_messages.append(Comp.Image(file=str(jacket_source)))
             
-            await self._run_game_session(event, game_data, intro_messages, answer_reveal_messages)
+            game_logs, score_updates = await self._run_game_session(event, game_data, intro_messages, answer_reveal_messages)
+            if game_logs or score_updates:
+                asyncio.create_task(self._robust_send_stats(game_logs, score_updates))
         except Exception as e:
             logger.error(f"游戏启动过程中发生未处理的异常: {e}", exc_info=True)
             await event.send(event.plain_result("......开始游戏时发生内部错误，已中断。"))
@@ -323,7 +328,8 @@ class GuessSongPlugin(Star):
         try:
             initiator_id = event.get_sender_id()
             initiator_name = event.get_sender_name()
-            await self.db_service.consume_daily_play_attempt(initiator_id, initiator_name)
+            is_independent_limit = self._get_setting_for_group(event, "independent_daily_limit", False)
+            await self.db_service.consume_daily_play_attempt(initiator_id, initiator_name, session_id, is_independent_limit)
             await self.stats_service.api_ping("guess_song_random")
 
             combined_kwargs, total_score, effect_names_display, mode_name_str = self.audio_service.get_random_mode_config()
@@ -370,7 +376,9 @@ class GuessSongPlugin(Star):
             if jacket_source:
                 answer_reveal_messages.append(Comp.Image(file=str(jacket_source)))
             
-            await self._run_game_session(event, game_data, intro_messages, answer_reveal_messages)
+            game_logs, score_updates = await self._run_game_session(event, game_data, intro_messages, answer_reveal_messages)
+            if game_logs or score_updates:
+                asyncio.create_task(self._robust_send_stats(game_logs, score_updates))
         except Exception as e:
             logger.error(f"游戏启动过程中发生未处理的异常: {e}", exc_info=True)
             await event.send(event.plain_result("......开始游戏时发生内部错误，已中断。"))
@@ -379,7 +387,7 @@ class GuessSongPlugin(Star):
                 self.context.active_game_sessions.remove(session_id)
             self.last_game_end_time[session_id] = time.time()
 
-    async def _run_game_session(self, event: AstrMessageEvent, game_data: Dict, intro_messages: List, answer_reveal_messages: List):
+    async def _run_game_session(self, event: AstrMessageEvent, game_data: Dict, intro_messages: List, answer_reveal_messages: List) -> Tuple[List[Dict], List[Dict]]:
         """统一的游戏会话执行器，包含简化的统计逻辑。"""
         session_id = _get_normalized_session_id(event)
         debug_mode = self.config.get("debug_mode", False)
@@ -391,6 +399,7 @@ class GuessSongPlugin(Star):
         guess_attempts_count = 0
         max_guess_attempts = self._get_setting_for_group(event, "max_guess_attempts", 10)
         game_results_to_log = []
+        score_updates_to_log = []
 
         try:
             await event.send(event.chain_result([Comp.Record(file=game_data["clip_path"])]))
@@ -399,13 +408,13 @@ class GuessSongPlugin(Star):
             if debug_mode:
                 logger.info("[猜歌插件] 调试模式已启用，立即显示答案")
                 await event.send(event.chain_result(answer_reveal_messages))
-                return
+                return [], [] # 调试模式下不发送统计数据
         except Exception as e:
             logger.error(f"发送消息失败: {e}. 游戏中断。", exc_info=True)
             if session_id in self.context.active_game_sessions:
                 self.context.active_game_sessions.remove(session_id)
             self.last_game_end_time[session_id] = time.time()
-            return
+            return [], [] # 发送失败时返回空列表
         finally:
             if debug_mode:
                 if session_id in self.context.active_game_sessions:
@@ -450,7 +459,11 @@ class GuessSongPlugin(Star):
             if game_data.get('game_type', '').startswith('guess_song'):
                 await self.db_service.update_stats(session_id, user_id, user_name, score_to_add, is_correct)
                 if score_to_add > 0:
-                    asyncio.create_task(self.stats_service.api_update_score(user_id, user_name, score_to_add))
+                    score_updates_to_log.append({
+                        "user_id": user_id,
+                        "user_name": user_name,
+                        "score_change": score_to_add
+                    })
 
                 await self.db_service.update_mode_stats(game_data['mode'], is_correct)
                 
@@ -491,10 +504,6 @@ class GuessSongPlugin(Star):
             if session_id in self.context.active_game_sessions:
                 self.context.active_game_sessions.remove(session_id)
         
-        if game_results_to_log:
-            for result in game_results_to_log:
-                asyncio.create_task(self.stats_service.api_log_game(result))
-        
         summary_prefix = f"本轮猜测已达上限({max_guess_attempts}次)！" if game_ended_by_attempts else "时间到！"
         if correct_players:
             winner_names = "、".join(player['name'] for player in correct_players.values())
@@ -505,6 +514,7 @@ class GuessSongPlugin(Star):
             await event.send(event.plain_result(summary_text))
             
         await event.send(event.chain_result(answer_reveal_messages))
+        return game_results_to_log, score_updates_to_log
 
     @filter.command("猜歌手")
     async def start_vocalist_game(self, event: AstrMessageEvent):
@@ -529,7 +539,8 @@ class GuessSongPlugin(Star):
         try:
             initiator_id = event.get_sender_id()
             initiator_name = event.get_sender_name()
-            await self.db_service.consume_daily_play_attempt(initiator_id, initiator_name)
+            is_independent_limit = self._get_setting_for_group(event, "independent_daily_limit", False)
+            await self.db_service.consume_daily_play_attempt(initiator_id, initiator_name, session_id, is_independent_limit)
             await self.stats_service.api_ping("guess_song_vocalist")
             
             debug_mode = self.config.get("debug_mode", False)
@@ -595,7 +606,9 @@ class GuessSongPlugin(Star):
                 Comp.Plain(f"正确答案是: {game_data['correct_answer_num']}. {correct_vocalist_name}")
             ]
 
-            await self._run_game_session(event, game_data, intro_messages, answer_reveal_messages)
+            game_logs, score_updates = await self._run_game_session(event, game_data, intro_messages, answer_reveal_messages)
+            if game_logs or score_updates:
+                asyncio.create_task(self._robust_send_stats(game_logs, score_updates))
         except Exception as e:
             logger.error(f"游戏启动过程中发生未处理的异常: {e}", exc_info=True)
             await event.send(event.plain_result("......开始游戏时发生内部错误，已中断。"))
@@ -751,25 +764,28 @@ class GuessSongPlugin(Star):
                 "  - 暂无记录"
             )
 
-        if local_global_stats:
-            today = datetime.now().strftime("%Y-%m-%d")
-            daily_plays = local_global_stats.get('daily_plays', 0)
-            last_play_date = local_global_stats.get('last_play_date', '')
-            games_today = daily_plays if last_play_date == today else 0
-            
-            # 使用新的辅助函数动态获取限制
-            play_limit = self._get_setting_for_group(event, "daily_play_limit", 15)
-            listen_limit = self._get_setting_for_group(event, "daily_listen_limit", 10)
-            
-            _, listen_today = await self.db_service.get_user_daily_limits(user_id)
-            
-            remaining_plays = max(0, play_limit - games_today)
-            remaining_listens = max(0, listen_limit - listen_today)
-            result_parts.append(
-                f"🕒 剩余次数\n"
-                f"  - 猜歌: {remaining_plays}/{play_limit}\n"
-                f"  - 听歌: {remaining_listens}/{listen_limit}"
-            )
+        # --- 剩余次数计算 ---
+        # 检查当前群聊是否配置为独立次数
+        is_independent_limit = self._get_setting_for_group(event, "independent_daily_limit", False)
+
+        # 使用新的辅助函数动态获取限制
+        play_limit = self._get_setting_for_group(event, "daily_play_limit", 15)
+        listen_limit = self._get_setting_for_group(event, "daily_listen_limit", 10)
+
+        # 获取今日已玩次数 (根据是否独立来决定查询方式)
+        games_today = await self.db_service.get_games_played_today(user_id, session_id, is_independent_limit)
+        _, listen_today = await self.db_service.get_user_daily_limits(user_id)
+        
+        remaining_plays = max(0, play_limit - games_today)
+        remaining_listens = max(0, listen_limit - listen_today)
+        
+        # 根据模式显示不同的提示
+        limit_type_str = " (本群)" if is_independent_limit else ""
+        result_parts.append(
+            f"🕒 剩余次数\n"
+            f"  - 猜歌{limit_type_str}: {remaining_plays}/{play_limit}\n"
+            f"  - 听歌: {remaining_listens}/{listen_limit}"
+        )
 
         await event.send(event.plain_result("\n\n".join(result_parts)))
     
@@ -1217,6 +1233,50 @@ class GuessSongPlugin(Star):
         yield event.plain_result(f"......正在将 {len(payload)} 条玩家数据同步至服务器...")
         await self.stats_service.migrate_scores(payload)
         yield event.plain_result("✅ 分数同步任务已完成。")
+
+    async def _robust_send_stats(self, game_logs: List[Dict], score_updates: List[Dict]):
+        """
+        一个健壮的后台任务，用于带重试机制地发送统计数据。
+        它被设计为通过 asyncio.create_task 来启动，不会阻塞主流程。
+        """
+        if not self.stats_service.api_key or (not game_logs and not score_updates):
+            return
+
+        # 短暂延迟，避免与游戏结束消息的发送抢占资源
+        await asyncio.sleep(2)
+        logger.debug(f"后台任务：开始发送 {len(game_logs)} 条游戏日志和 {len(score_updates)} 条分数更新。")
+
+        MAX_RETRIES = 3
+        RETRY_DELAY = 5  # seconds
+
+        log_tasks = []
+        for log in game_logs:
+            async def send_log_with_retry(log_data):
+                for attempt in range(MAX_RETRIES):
+                    if await self.stats_service.api_log_game(log_data):
+                        return
+                    if attempt < MAX_RETRIES - 1:
+                        await asyncio.sleep(RETRY_DELAY * (attempt + 1))
+                logger.error(f"发送游戏日志失败，已达最大重试次数: {log_data}")
+            log_tasks.append(send_log_with_retry(log))
+
+        score_tasks = []
+        for update in score_updates:
+            async def send_score_with_retry(score_data):
+                for attempt in range(MAX_RETRIES):
+                    if await self.stats_service.api_update_score(
+                        user_id=score_data['user_id'],
+                        user_name=score_data['user_name'],
+                        score_delta=score_data['score_change']
+                    ):
+                        return
+                    if attempt < MAX_RETRIES - 1:
+                        await asyncio.sleep(RETRY_DELAY * (attempt + 1))
+                logger.error(f"发送分数更新失败，已达最大重试次数: {score_data}")
+            score_tasks.append(send_score_with_retry(update))
+
+        await asyncio.gather(*(log_tasks + score_tasks))
+        logger.debug("后台统计数据发送任务完成。")
 
     async def terminate(self):
         """关闭线程池和后台任务"""

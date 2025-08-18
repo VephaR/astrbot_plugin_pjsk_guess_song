@@ -30,7 +30,7 @@ class DBService:
             await cursor.execute(f"INSERT INTO user_stats ({', '.join(columns)}) VALUES ({placeholders})", default_values)
 
     async def init_db(self):
-        """初始化数据库，创建表结构。"""
+        """初始化数据库，创建并迁移表结构。"""
         async with self._get_conn() as conn:
             # 在user_stats表中将user_id设为主键，以保证数据的唯一性。
             await conn.execute("""
@@ -48,6 +48,15 @@ class DBService:
                     mode TEXT PRIMARY KEY, total_attempts INTEGER DEFAULT 0, correct_attempts INTEGER DEFAULT 0
                 )
             """)
+
+            # --- 安全地添加新列以实现平滑升级 ---
+            try:
+                await conn.execute("ALTER TABLE user_stats ADD COLUMN group_daily_plays TEXT DEFAULT '{}'")
+                logger.info("数据库迁移：成功为 'user_stats' 表添加 'group_daily_plays' 列。")
+            except aiosqlite.OperationalError as e:
+                if "duplicate column name" not in str(e):
+                    raise
+
             await conn.commit()
 
     async def update_stats(self, session_id: str, user_id: str, user_name: str, score: int, correct: bool):
@@ -106,30 +115,77 @@ class DBService:
                       correct_streak, max_correct_streak, json.dumps(group_scores), user_id))
                 await conn.commit()
 
-    async def consume_daily_play_attempt(self, user_id: str, user_name: str):
+    async def consume_daily_play_attempt(self, user_id: str, user_name: str, session_id: str, is_independent: bool):
+        """根据是否为独立限制模式，消耗用户的每日游戏次数。"""
         async with self._get_conn() as conn:
             conn.row_factory = aiosqlite.Row
             async with conn.cursor() as cursor:
                 await self._ensure_user_exists(cursor, user_id, user_name)
-                await cursor.execute("SELECT daily_games_played, last_played_date FROM user_stats WHERE user_id = ?", (user_id,))
-                row = await cursor.fetchone()
-                
                 today = datetime.now().strftime("%Y-%m-%d")
-                daily_games = row['daily_games_played'] if row and row['last_played_date'] == today else 0
-                
-                await cursor.execute("UPDATE user_stats SET daily_games_played = ?, last_played_date = ?, user_name = ? WHERE user_id = ?",
-                                     ((daily_games or 0) + 1, today, user_name, user_id))
+
+                if is_independent:
+                    await cursor.execute("SELECT group_daily_plays FROM user_stats WHERE user_id = ?", (user_id,))
+                    row = await cursor.fetchone()
+                    group_plays = json.loads(row['group_daily_plays'] or '{}')
+                    group_stat = group_plays.get(session_id, {})
+
+                    current_count = group_stat.get('count', 0) if group_stat.get('date') == today else 0
+                    group_plays[session_id] = {'count': current_count + 1, 'date': today}
+
+                    await cursor.execute("UPDATE user_stats SET group_daily_plays = ?, user_name = ? WHERE user_id = ?",
+                                         (json.dumps(group_plays), user_name, user_id))
+                else:
+                    await cursor.execute("SELECT daily_games_played, last_played_date FROM user_stats WHERE user_id = ?", (user_id,))
+                    row = await cursor.fetchone()
+                    daily_games = row['daily_games_played'] if row and row['last_played_date'] == today else 0
+                    await cursor.execute("UPDATE user_stats SET daily_games_played = ?, last_played_date = ?, user_name = ? WHERE user_id = ?",
+                                         ((daily_games or 0) + 1, today, user_name, user_id))
                 await conn.commit()
 
-    async def can_play(self, user_id: str, daily_limit: int) -> bool:
+    async def can_play(self, user_id: str, daily_limit: int, session_id: str, is_independent: bool) -> bool:
+        """根据是否为独立限制模式，检查用户是否可以开始游戏。"""
         async with self._get_conn() as conn:
             conn.row_factory = aiosqlite.Row
             async with conn.cursor() as cursor:
-                await cursor.execute("SELECT daily_games_played, last_played_date FROM user_stats WHERE user_id = ?", (user_id,))
-                row = await cursor.fetchone()
-                if not row or row['last_played_date'] != datetime.now().strftime("%Y-%m-%d"):
-                    return True
-                return (row['daily_games_played'] or 0) < daily_limit
+                today = datetime.now().strftime("%Y-%m-%d")
+                
+                if is_independent:
+                    await cursor.execute("SELECT group_daily_plays FROM user_stats WHERE user_id = ?", (user_id,))
+                    row = await cursor.fetchone()
+                    if not row or not row['group_daily_plays']:
+                        return True
+                    
+                    group_plays = json.loads(row['group_daily_plays'])
+                    group_stat = group_plays.get(session_id, {})
+                    if group_stat.get('date') != today:
+                        return True
+                    return group_stat.get('count', 0) < daily_limit
+                else:
+                    await cursor.execute("SELECT daily_games_played, last_played_date FROM user_stats WHERE user_id = ?", (user_id,))
+                    row = await cursor.fetchone()
+                    if not row or row['last_played_date'] != today:
+                        return True
+                    return (row['daily_games_played'] or 0) < daily_limit
+
+    async def get_games_played_today(self, user_id: str, session_id: str, is_independent: bool) -> int:
+        """获取用户今天已玩的游戏次数，能自动处理独立模式和全局模式。"""
+        async with self._get_conn() as conn:
+            conn.row_factory = aiosqlite.Row
+            async with conn.cursor() as cursor:
+                today = datetime.now().strftime("%Y-%m-%d")
+                if is_independent:
+                    await cursor.execute("SELECT group_daily_plays FROM user_stats WHERE user_id = ?", (user_id,))
+                    row = await cursor.fetchone()
+                    if not row or not row['group_daily_plays']: return 0
+                    
+                    group_plays = json.loads(row['group_daily_plays'])
+                    group_stat = group_plays.get(session_id, {})
+                    return group_stat.get('count', 0) if group_stat.get('date') == today else 0
+                else:
+                    await cursor.execute("SELECT daily_games_played, last_played_date FROM user_stats WHERE user_id = ?", (user_id,))
+                    row = await cursor.fetchone()
+                    if not row or row['last_played_date'] != today: return 0
+                    return row['daily_games_played'] or 0
 
     async def record_listen_song(self, user_id: str, user_name: str):
         async with self._get_conn() as conn:

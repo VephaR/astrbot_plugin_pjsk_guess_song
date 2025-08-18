@@ -49,25 +49,29 @@ class StatsService:
         except Exception as e:
             logger.warning(f"Stats ping to {ping_url} failed: {e}")
 
-    async def api_log_game(self, game_log_data: dict):
+    async def api_log_game(self, game_log_data: dict) -> bool:
         """向服务器记录一条详细的游戏日志。"""
         session = await self._get_session()
-        if not session: return
+        if not session: return False
 
         post_url = f"{self.stats_server_url}/api/log_game"
         try:
             async with session.post(post_url, json=game_log_data, headers=self._get_api_headers(), timeout=3) as resp:
-                if resp.status != 200:
+                if resp.status == 200:
+                    return True
+                else:
                     logger.warning(f"记录游戏日志失败. Status: {resp.status}, Response: {await resp.text()}")
+                    return False
         except Exception as e:
             logger.warning(f"发送游戏日志至 {post_url} 失败: {e}")
+            return False
 
-    async def api_update_score(self, user_id: str, user_name: str, score_delta: int):
+    async def api_update_score(self, user_id: str, user_name: str, score_delta: int) -> bool:
         """向服务器同步玩家的分数变化。"""
-        if score_delta == 0: return
+        if score_delta == 0: return True
 
         session = await self._get_session()
-        if not session: return
+        if not session: return False
 
         payload = {
             "user_id": str(user_id),
@@ -77,10 +81,14 @@ class StatsService:
         post_url = f"{self.stats_server_url}/api/update_score"
         try:
             async with session.post(post_url, json=payload, headers=self._get_api_headers(), timeout=3) as resp:
-                if resp.status != 200:
+                if resp.status == 200:
+                    return True
+                else:
                     logger.warning(f"同步分数至服务器失败. Status: {resp.status}, Response: {await resp.text()}")
+                    return False
         except Exception as e:
             logger.warning(f"发送分数更新至 {post_url} 失败: {e}")
+            return False
 
     async def get_global_leaderboard(self) -> Optional[List[Dict]]:
         """通过API获取服务器排行榜数据。"""
