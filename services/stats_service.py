@@ -2,7 +2,7 @@ import asyncio
 import aiohttp
 import json
 from typing import Dict, Optional, List, Tuple
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import urlparse, urlencode
 
 from astrbot.api import logger
@@ -213,15 +213,15 @@ class StatsService:
             logger.error(f"处理用户模式排名响应时发生未知错误: {e}")
             return None
 
-    async def get_ranking_by_period_from_server(self, start_utc: datetime, end_utc: datetime) -> Optional[List[Dict]]:
+    async def get_ranking_by_period_from_server(self, start_dt: datetime, end_dt: datetime) -> Optional[List[Dict]]:
         """从服务器获取指定时间段内的全局排行榜数据。"""
         session = await self._get_session()
         if not session:
             return None
 
         params = {
-            "start_utc": start_utc.isoformat().replace('+00:00', 'Z'),
-            "end_utc": end_utc.isoformat().replace('+00:00', 'Z')
+            "start_time": start_dt.strftime("%Y-%m-%d %H:%M:%S"),
+            "end_time": end_dt.strftime("%Y-%m-%d %H:%M:%S")
         }
         ranking_url = f"{self.stats_server_url}/api/ranking_by_period?{urlencode(params)}"
         

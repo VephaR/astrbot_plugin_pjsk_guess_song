@@ -6,7 +6,7 @@ import os
 import re
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 
 try:
     import aiohttp
@@ -665,13 +665,13 @@ class GuessSongPlugin(Star):
 
     @filter.command("猜歌日榜", alias={"gsdaily"})
     async def show_daily_ranking(self, event: AstrMessageEvent):
-        """显示全局的今日猜歌排行榜(数据源: 服务器)"""
+        """显示全局的今日猜歌排行榜(数据源: 服务器, 按北京时间)"""
         if not await self._is_group_allowed(event): return
         if not self.stats_service.api_key:
             await event.send(event.plain_result("......未配置API Key，无法获取服务器日榜。"))
             return
 
-        now = datetime.now(timezone.utc)
+        now = datetime.now()
         start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
         
         rows = await self.stats_service.get_ranking_by_period_from_server(start_of_day, now)
@@ -680,13 +680,13 @@ class GuessSongPlugin(Star):
             await event.send(event.plain_result("......获取服务器日榜数据时出错，请检查后台日志。"))
             return
         if not rows:
-            await event.send(event.plain_result("......今天服务器上还没有任何猜歌记录。"))
+            await event.send(event.plain_result("......今天（北京时间）服务器上还没有任何猜歌记录。"))
             return
         
         # API返回的是字典列表，需要转换为元组列表以适配绘图函数
         formatted_rows = [(r['user_id'], r['user_name'], r['total_score'], r['total_attempts'], r['correct_attempts']) for r in rows]
 
-        date_str = datetime.now().strftime("%Y-%m-%d")
+        date_str = now.strftime("%Y-%m-%d (北京时间)")
         img_path = await self.audio_service.draw_ranking_image(formatted_rows[:10], "猜歌日榜", date_range_str=date_str)
         if img_path:
             await event.send(event.image_result(img_path))
@@ -695,13 +695,13 @@ class GuessSongPlugin(Star):
 
     @filter.command("猜歌周榜", alias={"gsweekly"})
     async def show_weekly_ranking(self, event: AstrMessageEvent):
-        """显示全局的本周猜歌排行榜(数据源: 服务器)"""
+        """显示全局的本周猜歌排行榜(数据源: 服务器, 按北京时间)"""
         if not await self._is_group_allowed(event): return
         if not self.stats_service.api_key:
             await event.send(event.plain_result("......未配置API Key，无法获取服务器周榜。"))
             return
 
-        now = datetime.now(timezone.utc)
+        now = datetime.now()
         start_of_week = now - timedelta(days=now.weekday())
         start_of_week = start_of_week.replace(hour=0, minute=0, second=0, microsecond=0)
 
@@ -711,12 +711,12 @@ class GuessSongPlugin(Star):
             await event.send(event.plain_result("......获取服务器周榜数据时出错，请检查后台日志。"))
             return
         if not rows:
-            await event.send(event.plain_result("......本周服务器上还没有任何猜歌记录。"))
+            await event.send(event.plain_result("......本周（北京时间）服务器上还没有任何猜歌记录。"))
             return
         
         formatted_rows = [(r['user_id'], r['user_name'], r['total_score'], r['total_attempts'], r['correct_attempts']) for r in rows]
         
-        date_range_str = f"{start_of_week.strftime('%Y-%m-%d')} ~ {datetime.now().strftime('%Y-%m-%d')}"
+        date_range_str = f"{start_of_week.strftime('%Y-%m-%d')} ~ {now.strftime('%Y-%m-%d')} (北京时间)"
         img_path = await self.audio_service.draw_ranking_image(formatted_rows[:10], "猜歌周榜", date_range_str=date_range_str)
         if img_path:
             await event.send(event.image_result(img_path))
