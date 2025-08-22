@@ -2,10 +2,11 @@ import asyncio
 import aiohttp
 import json
 from typing import Dict, Optional, List, Tuple
+from datetime import datetime, timedelta
+from urllib.parse import urlparse, urlencode
 
 from astrbot.api import logger
 from astrbot.api import AstrBotConfig
-from urllib.parse import urlparse
 
 class StatsService:
     def __init__(self, config: AstrBotConfig):
@@ -212,6 +213,32 @@ class StatsService:
             logger.error(f"处理用户模式排名响应时发生未知错误: {e}")
             return None
 
+    async def get_ranking_by_period_from_server(self, start_dt: datetime, end_dt: datetime) -> Optional[List[Dict]]:
+        """从服务器获取指定时间段内的全局排行榜数据。"""
+        session = await self._get_session()
+        if not session:
+            return None
+
+        params = {
+            "start_time": start_dt.strftime("%Y-%m-%d %H:%M:%S"),
+            "end_time": end_dt.strftime("%Y-%m-%d %H:%M:%S")
+        }
+        ranking_url = f"{self.stats_server_url}/api/ranking_by_period?{urlencode(params)}"
+        
+        try:
+            async with session.get(ranking_url, headers=self._get_api_headers(), timeout=15) as response:
+                if response.status == 200:
+                    return await response.json()
+                elif response.status == 401:
+                    logger.warning("API密钥无效，无法获取时段排行榜。")
+                    return None
+                else:
+                    logger.error(f"获取时段排行榜失败. Status: {response.status}, Response: {await response.text()}")
+                    return None
+        except Exception as e:
+            logger.error(f"请求服务器时段排行榜时出错: {e}", exc_info=True)
+            return None
+ 
     async def terminate(self):
         """关闭 aiohttp session"""
         if self._session and not self._session.closed:

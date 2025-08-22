@@ -459,12 +459,12 @@ class AudioService:
         img.save(img_path)
         return str(img_path)
 
-    async def draw_ranking_image(self, rows, title_text="猜歌排行榜") -> Optional[str]:
+    async def draw_ranking_image(self, rows, title_text="猜歌排行榜", date_range_str: Optional[str] = None) -> Optional[str]:
         """异步绘制排行榜图片。"""
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(self.executor, self._draw_ranking_image_sync, rows, title_text)
+        return await loop.run_in_executor(self.executor, self._draw_ranking_image_sync, rows, title_text, date_range_str)
 
-    def _draw_ranking_image_sync(self, rows, title_text="猜歌排行榜") -> Optional[str]:
+    def _draw_ranking_image_sync(self, rows, title_text="猜歌排行榜", date_range_str: Optional[str] = None) -> Optional[str]:
         """[同步] 排行榜图片绘制函数"""
         try:
             width, height = 650, 950

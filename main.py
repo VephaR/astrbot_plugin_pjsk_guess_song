@@ -6,7 +6,7 @@ import os
 import re
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
-from datetime import datetime
+from datetime import datetime, timedelta
 
 try:
     import aiohttp
@@ -167,6 +167,21 @@ class GuessSongPlugin(Star):
         if not await self._is_group_allowed(event):
             return False, None
 
+        # --- 新增：检查游戏是否在禁用时段 ---
+        now_time = datetime.now().time()
+        disable_periods = self._get_setting_for_group(event, "disable_guess_song_periods", [])
+        if isinstance(disable_periods, list):
+            for period in disable_periods:
+                try:
+                    start_time = datetime.strptime(period["start"], "%H:%M").time()
+                    end_time = datetime.strptime(period["end"], "%H:%M").time()
+                    if start_time <= now_time < end_time:
+                        default_msg = f"当前时段 ({period['start']} - {period['end']}) 猜歌功能已禁用。"
+                        return False, period.get("message", default_msg)
+                except (KeyError, ValueError) as e:
+                    logger.warning(f"跳过格式错误的禁用时段配置: {period}, 错误: {e}")
+                    continue
+        
         session_id = _get_normalized_session_id(event)
         cooldown = self._get_setting_for_group(event, "game_cooldown_seconds", 30)
         limit = self._get_setting_for_group(event, "daily_play_limit", 15)
@@ -647,6 +662,66 @@ class GuessSongPlugin(Star):
             await event.send(event.image_result(img_path))
         else:
             await event.send(event.plain_result("生成排行榜图片时出错。"))
+
+    @filter.command("猜歌日榜", alias={"gsdaily"})
+    async def show_daily_ranking(self, event: AstrMessageEvent):
+        """显示全局的今日猜歌排行榜(数据源: 服务器, 按北京时间)"""
+        if not await self._is_group_allowed(event): return
+        if not self.stats_service.api_key:
+            await event.send(event.plain_result("......未配置API Key，无法获取服务器日榜。"))
+            return
+
+        now = datetime.now()
+        start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        
+        rows = await self.stats_service.get_ranking_by_period_from_server(start_of_day, now)
+
+        if rows is None:
+            await event.send(event.plain_result("......获取服务器日榜数据时出错，请检查后台日志。"))
+            return
+        if not rows:
+            await event.send(event.plain_result("......今天（北京时间）服务器上还没有任何猜歌记录。"))
+            return
+        
+        # API返回的是字典列表，需要转换为元组列表以适配绘图函数
+        formatted_rows = [(r['user_id'], r['user_name'], r['total_score'], r['total_attempts'], r['correct_attempts']) for r in rows]
+
+        date_str = now.strftime("%Y-%m-%d (北京时间)")
+        img_path = await self.audio_service.draw_ranking_image(formatted_rows[:10], "猜歌日榜", date_range_str=date_str)
+        if img_path:
+            await event.send(event.image_result(img_path))
+        else:
+            await event.send(event.plain_result("生成日报图片时出错。"))
+
+    @filter.command("猜歌周榜", alias={"gsweekly"})
+    async def show_weekly_ranking(self, event: AstrMessageEvent):
+        """显示全局的本周猜歌排行榜(数据源: 服务器, 按北京时间)"""
+        if not await self._is_group_allowed(event): return
+        if not self.stats_service.api_key:
+            await event.send(event.plain_result("......未配置API Key，无法获取服务器周榜。"))
+            return
+
+        now = datetime.now()
+        start_of_week = now - timedelta(days=now.weekday())
+        start_of_week = start_of_week.replace(hour=0, minute=0, second=0, microsecond=0)
+
+        rows = await self.stats_service.get_ranking_by_period_from_server(start_of_week, now)
+
+        if rows is None:
+            await event.send(event.plain_result("......获取服务器周榜数据时出错，请检查后台日志。"))
+            return
+        if not rows:
+            await event.send(event.plain_result("......本周（北京时间）服务器上还没有任何猜歌记录。"))
+            return
+        
+        formatted_rows = [(r['user_id'], r['user_name'], r['total_score'], r['total_attempts'], r['correct_attempts']) for r in rows]
+        
+        date_range_str = f"{start_of_week.strftime('%Y-%m-%d')} ~ {now.strftime('%Y-%m-%d')} (北京时间)"
+        img_path = await self.audio_service.draw_ranking_image(formatted_rows[:10], "猜歌周榜", date_range_str=date_range_str)
+        if img_path:
+            await event.send(event.image_result(img_path))
+        else:
+            await event.send(event.plain_result("生成周报图片时出错。"))
 
     @filter.command("本地猜歌排行榜", alias={"localrank"})
     async def show_local_global_ranking(self, event: AstrMessageEvent):
